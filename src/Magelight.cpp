@@ -11,6 +11,7 @@
 #include "MagelightFonts.h"
 #include "MagelightSysInfo.h"
 #include "HotkeyNames.h"
+#include "TooltipCore.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -737,6 +738,7 @@ namespace Magelight {
         std::optional<HostTheme::KbTheme> kbTheme;   // 0.31.9: the VR keyboard's colours while this view holds UI mode
         ThemeLogRate themeLog;          // 0.31.9: this page's hostTheme log lines (OnPageHostTheme)
         bool outboundDropLogged = false;   // the outbound cap's one warning for this view (QueueOutboundLocked)
+        bool tooltipText = false;       // 1.2.0: the page was last sent a non-empty title (DrainTooltips)
         bool destroyPending = false;
         bool reloadPending = false;
         bool reloadedFlag = false;      // tag the next DOM-ready as a ViewReloaded
@@ -793,6 +795,24 @@ namespace Magelight {
         return nullptr;
     }
 
+    // Page tooltips (1.2.0, TooltipCore.h). WebCore reports the title under the pointer from inside a mouse event or
+    // an update (MlViewListener::OnChangeTooltip, render thread); the changes wait here, a leaf lock, until the frame
+    // hands them to the pages (DrainTooltips), which draw the tooltip themselves (the page core's '__tooltip').
+    static std::mutex s_tooltipMutex;
+    static std::vector<std::pair<ultralight::View*, std::string>> s_tooltipChanges;
+    static std::atomic<bool> s_tooltipLeaveAll{ false };   // UI mode ended or moved: every page hides its tooltip
+    static constexpr const char* kTooltipDispatch = "window.magelight&&window.magelight._dispatch('__tooltip',";
+    static void QueueOutboundLocked(MlView& v, OutboundCall call);
+
+    // s_viewsMutex must be held. The pointer left the page (another view, a hide, the end of UI mode): WebCore never
+    // sees that, so the page is told; it keeps the title and shows it again when the pointer comes back. Sent whether
+    // or not the page holds a title (one may still be on its way), but only to a loaded page, so it never queues up.
+    static void QueueTooltipLeaveLocked(MlView& v)
+    {
+        if (!v.ul || !v.domReady) return;
+        QueueOutboundLocked(v, { std::string(kTooltipDispatch) + "'{\"l\":1}');", {}, true });
+    }
+
     // s_viewsMutex must be held. ShowView's body, for a caller that must change visibility in the same critical
     // section as something else (ShowOwnKeyboard).
     static void ShowViewLocked(MlView& v, bool show)
@@ -801,6 +821,7 @@ namespace Magelight {
         v.visible = show;
         if (!v.ul) v.loadNow = show;   // an open never waits behind the load queue
         if (!show) v.pageCursor = 0;   // reopened, the page reports again on the first mouse move
+        if (!show) QueueTooltipLeaveLocked(v);
     }
 
     // s_viewsMutex must be held. A C++ -> JS call waits here until the page reaches DOM ready (DrainBridgeQueues);
@@ -1429,6 +1450,39 @@ namespace Magelight {
             "else if(m.state==='commit'){if(plain)clearPreedit(e);ime.base=null;ime.pre='';}"
             "else if(m.state==='end'){if(plain)clearPreedit(e);ime.el=null;ime.base=null;ime.pre='';}"
             "try{window.dispatchEvent(new CustomEvent('magelight:ime',{detail:m}));}catch(x){}});}"
+            "})();"
+            // Tooltips (1.2.0): the page draws the title the host hands it on '__tooltip' ({t, c}: the text, the
+            // cursor's height in CSS px; {l:1} = the pointer left the page, so nothing shows until it moves here
+            // again). 400 ms on a title, below the cursor, kept on screen; a click, a key or the wheel hides it and the
+            // same title stays hidden until it changes; a scroll hides it until the pointer moves. Opt out with
+            // data-ml-tooltip=off on an element (or <html>), or by cancelling the 'magelight:tooltip' event; the
+            // --ml-tooltip-bg/-fg/-border/-font properties style it.
+            "(function(){if(!window.magelight)return;var tip=null,text='',shown=false,timer=0,x=0,y=0,c=24,over=null,muted=null,away=false;"
+            "function off(e){while(e&&e.getAttribute){if(e.getAttribute('data-ml-tooltip')==='off')return true;e=e.parentNode;}return false;}"
+            "function el(){if(tip)return tip;tip=document.createElement('div');tip.id='__ml_tip';tip.setAttribute('aria-hidden','true');"
+            "var s=tip.style;s.position='fixed';s.left='0';s.top='0';s.zIndex='2147483646';s.pointerEvents='none';s.display='none';"
+            "s.whiteSpace='pre-line';s.boxSizing='border-box';s.padding='4px 8px';s.borderRadius='3px';"
+            "s.background='var(--ml-tooltip-bg,#1e1e20)';s.color='var(--ml-tooltip-fg,#f0f0f0)';"
+            "s.border='1px solid var(--ml-tooltip-border,#5c5c60)';s.font='var(--ml-tooltip-font,12px/1.35 sans-serif)';"
+            "s.boxShadow='0 2px 8px rgba(0,0,0,0.45)';document.documentElement.appendChild(tip);return tip;}"
+            "function hide(){clearTimeout(timer);timer=0;if(shown&&tip)tip.style.display='none';shown=false;}"
+            "function place(){var t=tip;t.style.left='0';t.style.top='0';var w=window.innerWidth,h=window.innerHeight,r=t.getBoundingClientRect(),l=x+2,o=y+c+4;"
+            "if(l+r.width>w-4)l=Math.max(4,w-4-r.width);if(o+r.height>h-4)o=Math.max(4,y-4-r.height);"
+            "t.style.left=Math.round(l)+'px';t.style.top=Math.round(o)+'px';}"
+            "function show(){timer=0;if(!text||text===muted||away)return;var go=!off(over);"
+            "if(go)try{go=window.dispatchEvent(new CustomEvent('magelight:tooltip',{cancelable:true,detail:{text:text,target:over}}));}catch(e){}"
+            "if(!go){hide();muted=text;return;}"
+            "var t=el();t.style.maxWidth=Math.max(160,Math.round(window.innerWidth*0.4))+'px';t.textContent=text;"
+            "t.style.display='block';shown=true;place();}"
+            "function arm(){clearTimeout(timer);timer=setTimeout(show,400);}"
+            "function quiet(){if(text)muted=text;hide();}"
+            "window.magelight.on('__tooltip',function(a){var m;try{m=JSON.parse(a);}catch(e){return;}"
+            "if(m.l){away=true;hide();return;}if(typeof m.c==='number')c=m.c;var t=typeof m.t==='string'?m.t:'';"
+            "if(t!==muted)muted=null;if(t===text&&(shown||timer))return;text=t;if(!t){hide();return;}if(shown)show();else arm();});"
+            "document.addEventListener('mousemove',function(ev){x=ev.clientX;y=ev.clientY;away=false;if(text&&!shown&&!timer&&text!==muted)arm();},true);"
+            "document.addEventListener('mouseover',function(ev){over=ev.target;},true);"
+            "document.addEventListener('mousedown',quiet,true);document.addEventListener('keydown',quiet,true);"
+            "document.addEventListener('wheel',quiet,true);document.addEventListener('scroll',hide,true);"
             "})();"
             "}";
         std::size_t count = 0;
@@ -2564,6 +2618,7 @@ namespace Magelight {
             }
             if (!snd.empty()) Sound::Play(snd, uiView);
         }
+        if (!on) s_tooltipLeaveAll.store(true);   // the pointer goes with UI mode
         Emit(on ? HostEvent::UIModeEntered : HostEvent::UIModeExited, uiView);
         InvokeJS(uiView, on ? "window.magelight&&window.magelight._dispatch('__uimode','1');"
                             : "window.magelight&&window.magelight._dispatch('__uimode','0');");
@@ -3767,6 +3822,12 @@ namespace Magelight {
             std::unique_lock<std::mutex> lk(s_viewsMutex, std::try_to_lock);
             if (!lk) return;
             if (MlView* v = FindViewByUlLocked(caller)) v->pageCursor = static_cast<int>(kind);
+        }
+        // Render thread, inside a mouse event or an update: the title under the pointer ("" = none).
+        void OnChangeTooltip(ultralight::View* caller, const ultralight::String& tooltip) override
+        {
+            std::lock_guard<std::mutex> lk(s_tooltipMutex);
+            Tooltip::Coalesce(s_tooltipChanges, caller, std::string(tooltip.utf8().data()));
         }
         // Render thread, synchronously inside View::CreateLocalInspectorView.
         ultralight::RefPtr<ultralight::View> OnCreateInspectorView(ultralight::View* caller, bool,
@@ -5151,6 +5212,30 @@ float4 ps_straight(VSOut i) : SV_Target {
         return mods;
     }
 
+    // Render thread, each frame after the input: the titles WebCore reported, one per page, as '__tooltip' calls.
+    // A change from Renderer::Update reaches the page a frame later; one that lands after a leave is kept by the page
+    // and shown only once the pointer is back.
+    static void DrainTooltips(float bh)
+    {
+        std::vector<std::pair<ultralight::View*, std::string>> changes;
+        {
+            std::lock_guard<std::mutex> lk(s_tooltipMutex);
+            changes.swap(s_tooltipChanges);
+        }
+        const bool leaveAll = s_tooltipLeaveAll.exchange(false);
+        if (changes.empty() && !leaveAll) return;
+        std::lock_guard<std::mutex> lk(s_viewsMutex);
+        for (auto& [ul, text] : changes) {
+            MlView* v = FindViewByUlLocked(ul);
+            if (!v || (text.empty() && !v->tooltipText)) continue;
+            v->tooltipText = !text.empty();
+            const float c = Tooltip::CursorCss(s_cursorHeight, bh, v->deviceScale);
+            QueueOutboundLocked(*v, { kTooltipDispatch + MlJsonQuote(Tooltip::Payload(text, c)) + ");", {}, true });
+        }
+        if (leaveAll)
+            for (auto& vp : s_views) QueueTooltipLeaveLocked(*vp);
+    }
+
     // Translate queued Windows messages into Ultralight events. Render thread
     // only — the sole thread allowed to touch views.
     // Routing: keys/text -> the UI-mode (focused) view; mouse -> the topmost
@@ -5225,6 +5310,13 @@ float4 ps_straight(VSOut i) : SV_Target {
             case WM_MOUSEMOVE: {
                 int tx = 0, ty = 0, step = 40; float ds = 1.f;
                 auto target = hitTest(GET_X_LPARAM(e.lparam), GET_Y_LPARAM(e.lparam), tx, ty, ds, step);
+                // Compared only, never dereferenced: the view it names is looked up in the registry first.
+                static ultralight::View* s_hoverUl = nullptr;
+                if (target.get() != s_hoverUl) {
+                    std::lock_guard<std::mutex> lk(s_viewsMutex);
+                    if (MlView* prev = FindViewByUlLocked(s_hoverUl)) QueueTooltipLeaveLocked(*prev);
+                    s_hoverUl = target.get();
+                }
                 if (!target) break;
                 UL evt{ UL::kType_MouseMoved,
                         static_cast<int>((GET_X_LPARAM(e.lparam) - tx) / ds), static_cast<int>((GET_Y_LPARAM(e.lparam) - ty) / ds),
@@ -6182,6 +6274,7 @@ float4 ps_straight(VSOut i) : SV_Target {
             for (MlView* v : dirty) InstallBridgeShims(*v, false);
         }
         DrainInputQueue(bw, bh);
+        DrainTooltips(bh);
         DrainBridgeQueues();
         // The CursorMenu's kShow processes a frame or two after SetUIMode, and its movie only exists once it has:
         // hide the vanilla cursor again just after and once the menu has settled.
@@ -7880,6 +7973,7 @@ float4 ps_straight(VSOut i) : SV_Target {
             ApplyFreezeWorld("view switch");   // follows the new view's preference (the inspector has none)
             ShowView(view, true);
             QueueInput(0, 1, 0);   // re-run the focus marker: key focus follows s_uiModeView
+            s_tooltipLeaveAll.store(true);
             InvokeJS(old, "window.magelight&&window.magelight._dispatch('__uimode','0');");
             InvokeJS(view, "window.magelight&&window.magelight._dispatch('__uimode','1');");
             SKSE::log::info("Magelight: UI mode switched from view {} to view {}", old, view);

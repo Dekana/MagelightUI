@@ -520,7 +520,8 @@ namespace MAGELIGHT_API {
                                                             // "cursor" (0.31.0) "cursorTint" (0.31.1) "csp"
                                                             // (0.31.5) "rebuildScale" (0.31.7)
                                                             // "keyboardTheme" (0.31.9), "prepaint" (0.31.11),
-                                                            // "uiModeCancel" "hostThemeReply" (1.1.0). The
+                                                            // "uiModeCancel" "hostThemeReply" (1.1.0),
+                                                            // "tooltips" (1.2.0). The
                                                             // page-injected window.__MAGELIGHT__.capabilities
                                                             // (SDK: host.can) and the SDK mock carry this same
                                                             // set under the camelCase spellings shown (the page

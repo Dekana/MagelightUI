@@ -13,6 +13,7 @@ The **"added in"** column is the version to put in `minHost` (manifest) /
 
 | Added | Gate | Feature |
 |---|---|---|
+| 1.2.0 | 10200 | `title` tooltips: the host passes the title under the pointer to the page core, which draws it (400 ms, below the cursor); `data-ml-tooltip="off"` or a cancelled `magelight:tooltip` event opts out, `--ml-tooltip-bg/-fg/-border/-font` style it; `capabilities.tooltips` |
 | 1.1.0 | 10100 | `CancelUIModeRequest(mod)` — withdraw your UI-mode entry the host has not run yet (and your queued requests), with no `UIModeEntered` or `UIModeRefused` for it; `kUIModeFlagReclaim` on `RequestUIMode` — withdraw your own release that has not run and keep the mode; `QueryCapability("uimodecancel")` |
 | 1.1.0 | 10100 | `magelight.hostTheme`: a part with a bad value is refused alone (the other still applies), and `reply: true` answers on the `__hostthemeresult` channel; `QueryCapability("hostthemereply")` |
 | 1.0.0 | 10000 | No new API: 0.31.11's host under a stable version. Every gate above holds (10000 is above each packed number), and the npm packages follow at 1.0.0 |
@@ -48,6 +49,19 @@ The **"added in"** column is the version to put in `minHost` (manifest) /
 | 0.12.0 | — | `BindHotkey` registry; manifest `hotkey` |
 | 0.11.0 | — | Sessions / manifest docs |
 | 0.10.0 | — | API v4 (`MagelightApi4`): per-mod registration, texture images, UI mode, events |
+
+## 1.2.0
+
+- **`title` tooltips show.** Ultralight reports the title under the pointer but draws nothing, so a
+  page's `title` attributes were invisible in game. The host now hands each change to the page core,
+  which draws the tooltip inside the page: after 400 ms on the element, below the drawn cursor and kept
+  on screen, with the title's line breaks. A click, a key or the wheel hides it and the same title stays
+  hidden until the pointer finds another; a scroll hides it until the pointer moves; leaving the page, a
+  hide and the end of UI mode hide it until the pointer is back. `capabilities.tooltips` says the host has it.
+- **A page that draws its own tooltips** sets `data-ml-tooltip="off"` on those elements (or on `<html>`
+  for the whole page), or cancels the `magelight:tooltip` event (`detail.text`, `detail.target`), or
+  the user sees both. The look follows `--ml-tooltip-bg`, `--ml-tooltip-fg`, `--ml-tooltip-border` and
+  `--ml-tooltip-font` where the page sets them.
 
 ## 1.1.0
 

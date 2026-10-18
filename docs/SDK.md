@@ -35,6 +35,12 @@ window.magelight     = { send(channel, payload), on(channel, fn) → off, off(ch
 - **`__prepaint`** (host 0.31.11): `send('__prepaint', '1')` asks the host to paint this view once while it
   is hidden, after it loads, so its first show is not one long frame ([CPP.md](CPP.md), "A painted first
   open"); `'0'` turns it off. `capabilities.prepaint` says the host has it.
+- **Tooltips** (host 1.2.0): an element's `title` shows as a tooltip the page core draws (the host
+  passes it on the reserved `__tooltip` channel; nothing to subscribe). `data-ml-tooltip="off"` on an
+  element or on `<html>` turns it off there, a `magelight:tooltip` event (cancelable; `detail.text`,
+  `detail.target`) fires before each one shows, and `--ml-tooltip-bg`, `--ml-tooltip-fg`,
+  `--ml-tooltip-border`, `--ml-tooltip-font` restyle it. `capabilities.tooltips` says the host has it; a
+  page that draws its own tooltips opts out on those elements.
 - **`__hosttheme`** (host 0.31.9): `magelight.hostTheme(theme)` gives the host this view's colours for
   what the host draws itself. `capabilities.keyboardTheme` says the host has it; the SDK's `host.hostTheme`
   calls it and does nothing on an older host. See "Host theme" below.

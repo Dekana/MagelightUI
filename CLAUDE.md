@@ -34,6 +34,7 @@ assets/, interface/         loose runtime files, the blank focus-menu SWF (the c
 tools/desktop-harness/      run our driver (or AppCore's) on the desktop — no game needed
 tools/font-test/            the stock font loader vs ours on imitated broken systems (build.bat builds and runs it)
 tools/hosttheme-test/       src/HostThemeCore.h's keyboard-theme colour rules (build.bat builds and runs it)
+tools/tooltip-test/         src/TooltipCore.h's coalescing, clipping and payload rules (build.bat builds and runs it)
 docs/                       MANIFEST.md, CPP.md, SDK.md, PAPYRUS.md, VR_PRESENTER.md
 build.ps1                   build → C:\b\mgl (or MG_BUILD_DIR), stage → <that>\stage (namespaced runtime patch)
 ```

@@ -13,7 +13,8 @@ path. Most of what breaks here is invisible in Chrome. Read `CLAUDE.md` invarian
 | CSS `zoom` | Ignored | `transform: scale()` from the top-left with compensated width/height (SA's shell) |
 | CSS `filter` on an ImageSource image; `canvas.drawImage` from one | Blank (bitmap fallback) | Filter a wrapper, not the image; no canvas read-back |
 | `<video>`, `<audio>`, WebGL, WASM, `Intl`, native `<select>/<input type=range/date/color>` | Unsupported | Animated WebP; SKSE-side audio; custom controls |
-| `cursor: url()`, `title` tooltips, HTML5 drag-and-drop | Ignored | Host cursor sprites; CSS tooltips; pointer events |
+| `cursor: url()`, HTML5 drag-and-drop | Ignored | Host cursor sprites; pointer events |
+| `title` tooltips | Drawn by the page core from 1.2.0 (`capabilities.tooltips`); nothing before | A page with its own tooltip sets `data-ml-tooltip="off"` on it, or the user sees two |
 | Remote `<script>`/`<link>`/fetch | Refused (file-only by default since 0.30.0; a mod opts into loopback or, from its DLL, any host with `SetNetworkPolicy`) | Bundle everything and load it over `file:///`; loopback only when the mod opted in |
 | Heavy component libraries (MUI-class trees) | 20-50 ms/frame in-engine | Keep pages light; virtualize lists |
 

@@ -1107,6 +1107,7 @@ namespace Magelight::Api4 {
         if (n == "prepaint") return 1;      // SetViewPrepaint / __prepaint / manifest "prepaint" (0.31.11)
         if (n == "uimodecancel") return 1;  // CancelUIModeRequest / kUIModeFlagReclaim (1.1.0)
         if (n == "hostthemereply") return 1; // hostTheme per-part refusal and its "reply" (1.1.0)
+        if (n == "tooltips") return 1;      // page title tooltips, drawn by the page core (1.2.0)
         if (n == "inspector") return (Magelight::DevModeEnabled() && Magelight::InspectorAvailable()) ? 1 : 0;
         return 0;
     }
@@ -1220,7 +1221,7 @@ namespace Magelight::Api4 {
                                         "loopback", "csp", "escapeCapture", "viewOrder", "scrollStep", "networkPolicy",
                                         "sound", "freezeWorld", "consoleLog", "loadStagger", "loadOnShow", "cursor",
                                         "cursorTint", "rebuildScale", "keyboardTheme", "prepaint", "uiModeCancel",
-                                        "hostThemeReply" };
+                                        "hostThemeReply", "tooltips" };
         std::string out = "{";
         bool first = true;
         for (const char* n : kNames) {
