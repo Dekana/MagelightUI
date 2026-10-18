@@ -74,6 +74,25 @@ The **"added in"** column is the version to put in `minHost` (manifest) /
   that each records the first exception at an address, whoever raised it, that most are handled by the mod
   that raised them, and that a crash is in CrashLogger's report.
 - **`"exceptionTelemetry": false`** in `Magelight.json` takes the handler out entirely (from kDataLoaded).
+- **The game's cursor no longer flashes over a page when another menu opens.** The game does not keep its
+  Cursor Menu open: a mod's menu opening while a page holds the mouse (SeverActions' item previews on its
+  Outfits page, for one) can make the game close it and show it again, which builds a new, visible cursor
+  above the pages. Magelight hid it only at its next once-a-second check, so the game's cursor showed over
+  Magelight's for up to a second each time, or most of the time with a mod that does it often. A reopened
+  Cursor Menu is now hidden at once, and again over the next few frames.
+- **While a page holds the mouse, the game's cursor is not drawn at all** (flat): Magelight skips the
+  Cursor Menu's draw, so the game's Cursor Menu cannot draw over Magelight's cursor, whatever shows it
+  again (a cursor replacer's script, another mod). The log says once a session that the skip is working. The menu stays open and the cursor still moves. `"skipGameCursor": false`
+  in `Magelight.json` turns this off.
+- **The log names what draws over a page, and a second cursor's source.** In the UI-pass composite pages
+  draw inside one of Magelight's engine menus, so a menu another mod draws higher covers them and their
+  cursor. Shortly after a page takes the mouse the log lists the menus drawn over the pages, and says how
+  the game's own cursor stands (its menu's depth, hidden or drawn, over or under the pages, the movie a
+  cursor replacer loads) and whether Windows' cursor shows over the game; each line again only when it
+  changes, and the menu list is re-checked every second while the page holds the mouse. Something that
+  shows the game's cursor again after Magelight hid it, and Windows' cursor showing over the game, get a
+  warning the first few times a session. Every menu's depth and flags are logged the first time it opens.
+  See TROUBLESHOOTING, "Something draws over the page or its cursor".
 
 ## 1.1.0
 

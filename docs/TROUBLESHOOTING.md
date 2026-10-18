@@ -166,7 +166,43 @@ set `"modCursors": false` (since 0.31.1 that also drops a mod's cursor colours, 
 tint: ...` in the log). `Magelight.log` names each view's cursor (`view N cursor: ...`) and
 each image it loads, or why one failed (`cursor image ... - not an image Windows can read`); a
 failed image shows Magelight's cursor instead. In VR the laser keeps its dot; with
-`vr.cursorDot` `false` it shows the mod's image.
+`vr.cursorDot` `false` it shows the mod's image. If another cursor or a menu draws over
+Magelight's, see "Something draws over the page or its cursor".
+
+## Something draws over the page or its cursor
+
+In the UI-pass composite (`composite` `ui`, or `auto` behind an upscaler or a swapchain wrapper)
+pages are drawn while one of Magelight's own engine menus draws, at depth 9. A menu another mod
+draws higher, or one at the same depth opened later, therefore covers the pages and the cursor:
+a second cursor on top of Magelight's, for one. Shortly after a page takes the mouse,
+`Magelight.log` names those menus (`menus drawn over the pages: <menu> (<depth>), ...`, or
+`none`; Magelight's own focus menu and the game's cursor are left out of the list), again only when
+that list changes, re-checked every second while a page holds the mouse; outside the UI pass it says
+the views draw after every menu instead. It also records every menu's depth and flags the first time
+the menu opens (`menu '<name>' depth <n> flags ...`). Something drawn at Present, an ImGui overlay for
+one, is not a menu: it can cover the pages whatever the composite, and is not listed.
+
+For a second cursor over the page, read these lines:
+
+- `the game's cursor while a page holds the mouse: ...` (at each UI-mode entry, when it changes): the
+  Cursor Menu's depth, whether its sprite is `hidden` (Magelight hides it) or `DRAWN`, whether it draws
+  over or under the pages, the movie it loads (a cursor replacer names its own file), and whether
+  Windows' cursor shows over the game.
+- `the game's cursor draw is being skipped ...` (once a session): `skipGameCursor` is working, so the
+  game's own cursor cannot be the second one; read the menu list and the Windows line instead.
+- `something showed the game's cursor again ...`: after Magelight hid the sprite, something set it
+  visible again, usually a cursor replacer's own script or another mod. With `skipGameCursor` (the
+  default) it is only noted, since the sprite is not drawn anyway. With `skipGameCursor` false it is a
+  warning: Magelight hides it again every second, so it flickers or seems stuck; try without the cursor
+  mod the line's movie names.
+- `Windows' own cursor shows over the game ...` (a warning): the second cursor is Windows' arrow, not the
+  game's. Alt-tabbing out and back usually hides it.
+- `menu 'Cursor Menu' CLOSED` then `OPENED while UI mode is on`, usually right after another menu opens: the
+  game rebuilt its cursor, which starts visible. Since 1.2.0 it is not drawn at all with `skipGameCursor`,
+  and hidden at once otherwise; before, it showed for up to a second each time.
+
+`"composite": "engine"` draws the pages after every menu, from the engine's end of frame; it has
+not been tried with an upscaler's frame generation, so check that the pages still show with it on.
 
 ## Rendering oddities (Ultralight 1.4 GPU path)
 
@@ -204,7 +240,7 @@ it read, or says that defaults are in effect.
 | `logLevel` | `"info"` | `trace`, `debug`, `info`, `warn` or `error` |
 | `forceCpu` | `false` | Skip the GPU driver and use Ultralight's CPU renderer |
 | `presentHook` | `"auto"` | Where pages are drawn onto the frame. `auto` draws inside dxgi's own Present when another mod hooked Present first on a plain dxgi swapchain (an upscaler, for one) and could otherwise draw over the pages, or for NVIDIA Smooth Motion when engine mode is off and d3d11.dll is not a proxy such as ENB's; never on VR. `late` tries it wherever dxgi's own Present can be reached: not behind a dxgi.dll proxy such as ReShade's, where it logs why and draws in the vtable hook. `vtable` never does. Try `late` when a page opens (sound, paused game) but stays invisible, but not with ENB: behind ENB's `d3d11.dll`, `late` can crash the game at start |
-| `composite` | `"auto"` | The stage pages are drawn at. `present` draws them over the finished frame at Present; `ui` draws them in the game's own UI pass, as part of the game's menus (click-through HUD pages draw at Present while no interactive page is open). `auto` uses `ui` when Skyrim Upscaler is installed or the game's swapchain is not dxgi's own: NVIDIA Streamline's (`sl.interposer.dll`: Skyrim Upscaler, Community Shaders' and Open Shaders' upscaling), since a HUD Fix keeps the game's UI apart from the scene and frame generation drops anything drawn at Present, or another wrapper such as ENB's or ReShade's `d3d11.dll` / `dxgi.dll` proxy (0.31.8), which may present a buffer other than the one pages are drawn into, but not a frame-generation swapchain on Direct3D 12 or NVIDIA Smooth Motion without engine mode; never on VR. Try `ui` when a page opens (sound, paused game) but stays invisible, and `present` if a page misbehaves only in the UI pass |
+| `composite` | `"auto"` | The stage pages are drawn at. `present` draws them over the finished frame at Present; `engine` draws them from the engine's end of frame, after every menu, with the engine's own device (flat only; what `auto` uses under NVIDIA Smooth Motion); `ui` draws them in the game's own UI pass, as part of the game's menus (click-through HUD pages draw at Present while no interactive page is open). `auto` uses `ui` when Skyrim Upscaler is installed or the game's swapchain is not dxgi's own: NVIDIA Streamline's (`sl.interposer.dll`: Skyrim Upscaler, Community Shaders' and Open Shaders' upscaling), since a HUD Fix keeps the game's UI apart from the scene and frame generation drops anything drawn at Present, or another wrapper such as ENB's or ReShade's `d3d11.dll` / `dxgi.dll` proxy (0.31.8), which may present a buffer other than the one pages are drawn into, but not a frame-generation swapchain on Direct3D 12 or NVIDIA Smooth Motion without engine mode; never on VR. Try `ui` when a page opens (sound, paused game) but stays invisible, and `present` if a page misbehaves only in the UI pass |
 | `freezeWorld` | `true` | Lets mods stop the game's 3D world render behind a paused fullscreen page (0.31.0; flat only). `false` turns it off for every mod and restores 0.30.6's menu flags; try it if the background behind a page goes black or a page stops answering when it opens |
 | `freezeWorldSkipCapture` | `true` | In UI-pass composite (`composite` `ui`, or `auto` behind an upscaler or a swapchain wrapper), keeps pages out of the frame the game freezes as the background. `false` if a page flickers when the freeze starts. No effect with composite `present` or `engine`, or with `freezeWorld` `false` |
 | `msaa` | `4` | 0.31.0: anti-aliasing samples for page shapes on the GPU path: SVG, icons and other non-rectangular shapes (boxes, rounded corners and text are smooth either way). `1` turns it off, `2`, `4` or `8`. Each count above 1 adds that many copies of every page target in video memory (about 15 MB each at 2560x1440), held while the page exists (hidden too, until a hibernating page frees it): at the default 4 that is at least about 60 MB per full-screen page, plus about the same again for each full-size layer the page composites (a transformed or translucent group, such as a transform-scaled shell). A count the graphics card cannot do steps down; any other number rounds down to one of these |
@@ -214,6 +250,7 @@ it read, or says that defaults are in effect.
 | `cursorHotspotX`, `cursorHotspotY` | `0`, `0` | The pointer pixel of a `cursorFile` image, 0-1 across and down |
 | `cursorForce`, `modCursors` | `false`, `true` | 0.31.0: mods may bring their own cursor. `cursorForce` `true` shows yours (your `cursorFile`, else the drawn cursor) everywhere, over every mod's cursor and over pages that hide the pointer. `modCursors` `false` ignores mods' cursor images and colours (0.31.1), but a page that draws its own pointer still hides yours. See "The cursor looks different over one mod, or disappears" |
 | `loadStagger`, `loadBudgetMs` | `true`, `8` | 0.31.0: views not yet opened start loading their pages one per frame after a load, the next once the previous page is ready or failed (or 100 ms passed) and the last frame's page work took under `loadBudgetMs` (1-100), at most about a second per batch; a view being opened, or visible at creation, loads at once. `false` loads every page in the same frame, as before 0.31.0. See "Performance" |
+| `skipGameCursor` | `true` | 1.2.0: while a page holds UI mode, the game's own cursor is not drawn (its Cursor Menu's draw is skipped), so the game's Cursor Menu cannot draw over Magelight's cursor (a mod drawing a cursor of its own still can). Flat only. `false` installs nothing |
 | `blockPolledKeys` | `true` | 0.31.10: while a page holds UI mode, other SKSE plugins that ask Windows for the key state themselves (`GetAsyncKeyState` / `GetKeyState`) read every keyboard key as up, so typing into a page cannot fire their hotkeys. The plugin whose page it is is exempt. `false` installs no filter |
 | `stallWatchdog`, `stallThresholdMs` | `true`, `1500` | Log the present and main threads' stacks when no frame is presented for this long (250-60000 ms); the first time per session, every other thread's too |
 | `exceptionTelemetry` | `true` | The `Magelight VEH` lines (see "Magelight VEH" below). `false` takes Magelight's exception handler out of the game entirely, from the main menu on |
