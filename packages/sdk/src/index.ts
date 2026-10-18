@@ -8,6 +8,7 @@ export type {
   Unsubscribe,
   HexColor,
   HostTheme,
+  HostThemeResult,
   KeyboardThemeColors,
   CursorThemeColors,
 } from './types.js';

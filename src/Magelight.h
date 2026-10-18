@@ -269,8 +269,14 @@ namespace Magelight {
     void EnterUIMode(ViewId view);
     // pauseGame: push our engine menu with kPausesGame — the world freezes
     // while the view is up (Papyrus keeps running, like vanilla menus).
-    void EnterUIModeEx(ViewId view, bool pauseGame, bool noTextEntry = false);
-    void ExitUIMode();
+    // ticket (1.1.0): from NewUIModeTicket, so the API layer can withdraw the posted entry or exit with
+    // CancelUIModeTicket before its game-thread task runs (the task then does nothing and emits nothing);
+    // 0 = untracked, as before.
+    void EnterUIModeEx(ViewId view, bool pauseGame, bool noTextEntry = false, std::uint64_t ticket = 0);
+    void ExitUIMode(std::uint64_t ticket = 0);
+    std::uint64_t NewUIModeTicket();
+    // True when the ticket's task had not run yet and now never will.
+    bool CancelUIModeTicket(std::uint64_t ticket);
     // While UI mode is active, retarget it to another view without leaving
     // (controls stay suspended, cursor stays up, key focus moves). Game-thread
     // task; refusals emit UIModeRefused with a "switch: ..." detail, success

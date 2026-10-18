@@ -70,9 +70,18 @@ magelight.hostTheme({
 - **`cursor`**: `lit`, `shade`, `ink`, `glow`, `ibeam`, all optional (one left out keeps the host's
   colour). The same slot as C++ `SetViewCursorTint`, with its rules: the view's own cursor images win,
   the player's `cursorForce` and `modCursors: false` drop it, and on VR the laser dot takes `lit` and `ink`.
-- **Strict**: every colour is exactly `#rrggbb`; one bad value, a `text` with under 3:1 contrast on `key`,
-  `keyHover` or `panel`, or a message over 2 KB refuses the whole message and changes nothing. A refusal is
-  a warning in `Magelight.log` (a view's first 32); the call itself never throws.
+- **Strict, per part**: every colour is exactly `#rrggbb`. A bad value in a part, or a `text` with under 3:1
+  contrast on `key`, `keyHover` or `panel`, refuses that part and leaves it as it was; the other part still
+  applies (1.1.0; before 1.1.0 it refused the whole message). A message over 2 KB, one that is not a JSON
+  object, or a `v` other than `1` refuses everything. A refusal is a warning in `Magelight.log` (a view's
+  first 32); the call itself never throws.
+- **Reply** (1.1.0, `capabilities.hostThemeReply`): add `reply: true` and the host answers on the reserved
+  `__hostthemeresult` channel with `{ keyboard, cursor, why? }`, each part `"set"`, `"cleared"`, `"kept"` or
+  `"refused"`, and `why` the first refusal's reason. The payload is JSON text: `JSON.parse` it in
+  `magelight.on('__hostthemeresult', fn)`, or use the SDK's `bridge.on<HostThemeResult>('__hostthemeresult', fn)`,
+  which parses it.
+  Without `reply` nothing is sent, so a page that never listens is sent nothing. A message refused whole
+  before it could be read (over 2 KB, not JSON) gets no reply.
 - **Scope**: only the calling view's own slots change, and they stay until changed, a reload of the page
   included, or until the view is destroyed. Send it again whenever your theme changes; sending the same
   theme again changes nothing. `Magelight.log` records a view's first change and then at most one a

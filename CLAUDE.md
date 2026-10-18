@@ -163,8 +163,8 @@ a PR that touches `src/`, `api/`, `gpu/`, `build.ps1` or the SDK.
     loads. `tools/font-test` reproduces the crash on the stock loader.
 20. **The VR keyboard page never sees what a mod sent.** It is shared by every mod and its
     keys go to the UI-mode view (`__key`), so a theme (`SetViewKeyboardTheme`, a page's
-    `__hosttheme`) is checked in full by `src/HostThemeCore.h` before anything is stored, a
-    message with one bad value changes nothing, and the keyboard gets a JSON the host builds from
+    `__hosttheme`) is checked in full by `src/HostThemeCore.h` before it is stored, a part with
+    one bad value changes nothing (a page message's other part still applies), and the keyboard gets a JSON the host builds from
     the stored numbers (`QueueKeyboardThemeLocked`). The keyboard page itself may not set one.
     Each message carries the whole state (shown + theme), replaces any still queued, and is
     queued under `s_viewsMutex` with the store or visibility change it reports.

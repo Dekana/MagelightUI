@@ -1152,9 +1152,10 @@ namespace Magelight {
         return buf;
     }
 
-    // 0.31.9, JS thread: magelight.hostTheme(obj | null). The keyboard page types into the UI-mode view, so a
-    // theme is checked here in full before anything is stored: one bad value refuses the whole message (no partial
-    // theme), and only the caller's own slots change. Log lines are rate-limited per view (ThemeLogRate).
+    // 0.31.9, JS thread: magelight.hostTheme(obj | null). The keyboard page types into the UI-mode view, so each
+    // part is checked here in full before it is stored: a part with a bad value is refused alone and changes
+    // nothing (1.1.0; the other part still applies), a message over 2 KB, not a JSON object or with v != 1 changes
+    // nothing at all, and only the caller's own slots change. Log lines are rate-limited per view (ThemeLogRate).
     static constexpr std::size_t kHostThemeMaxBytes = 2048;
 
     static void RefuseHostTheme(ViewId id, const std::string& why)
@@ -1169,12 +1170,27 @@ namespace Magelight {
                             n == kThemeRefusalsLogged ? "; this view's later refusals are counted, not logged" : "");
     }
 
+    // The page's reply on the reserved '__hostthemeresult' channel (1.1.0), sent only when its message asked with
+    // "reply": true, so a page that never listens is sent nothing: each part "set", "cleared", "kept" or "refused",
+    // and why the first refused part was refused.
+    static void ReplyHostTheme(ViewId id, const char* keyboard, const char* cursor, const std::string& why)
+    {
+        nlohmann::json j{ { "keyboard", keyboard }, { "cursor", cursor } };
+        if (!why.empty()) j["why"] = why;
+        InteropCall(id, "__hostthemeresult", j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+    }
+
     static void OnPageHostTheme(ViewId id, const std::string& arg)
     {
         if (id == static_cast<ViewId>(s_kbViewId.load())) return RefuseHostTheme(id, "the keyboard page cannot set a theme");
         if (arg.size() > kHostThemeMaxBytes) return RefuseHostTheme(id, "the message is over 2 KB");
         enum class Part { Keep, Clear, Set };   // the part absent, null, or an object
         Part kbPart = Part::Keep, cursorPart = Part::Keep;
+        // A part with a bad value is refused alone (1.1.0) and the other part still applies: a keyboard that fails
+        // the contrast rules no longer drops the cursor tint sent with it.
+        bool kbRefused = false, cursorRefused = false;
+        std::string why;   // the first refused part's reason, for the reply
+        bool reply = false;
         HostTheme::KbTheme kb{};
         std::string notes;   // optional colours ResolveKeyboard discarded, a low-contrast accent
         CursorTintSet tint;
@@ -1188,10 +1204,19 @@ namespace Magelight {
                 return RefuseHostTheme(id, "the message is not JSON");
             }
             if (!j.is_object()) return RefuseHostTheme(id, "the message is not a JSON object");
+            if (const auto r = j.find("reply"); r != j.end() && r->is_boolean()) reply = r->get<bool>();
             const auto ver = j.find("v");
-            if (ver == j.end() || !ver->is_number_integer() || ver->get<std::int64_t>() != 1)
-                return RefuseHostTheme(id, "\"v\" must be 1");
-            // A colour of a part: false when absent or bad; `bad` names the first bad one. Unknown keys are ignored.
+            if (ver == j.end() || !ver->is_number_integer() || ver->get<std::int64_t>() != 1) {
+                RefuseHostTheme(id, "\"v\" must be 1");
+                if (reply) ReplyHostTheme(id, "refused", "refused", "\"v\" must be 1");
+                return;
+            }
+            const auto refusePart = [&](bool& refused, const std::string& reason) {
+                refused = true;
+                if (why.empty()) why = reason;
+                RefuseHostTheme(id, reason);
+            };
+            // A colour of a part: false when absent or bad; `bad` names the part's first bad one. Unknown keys are ignored.
             std::string bad;
             const auto colour = [&bad](const nlohmann::json& part, const char* partName, const char* key, std::uint32_t& rgb) {
                 const auto it = part.find(key);
@@ -1204,22 +1229,23 @@ namespace Magelight {
                 if (k->is_null()) {
                     kbPart = Part::Clear;
                 } else if (!k->is_object()) {
-                    return RefuseHostTheme(id, "\"keyboard\" must be an object or null");
+                    refusePart(kbRefused, "\"keyboard\" must be an object or null");
                 } else {
                     HostTheme::KbInput in;
                     for (int i = 0; i < HostTheme::kKbTokens; ++i)
                         in.given[i] = colour(*k, "keyboard", HostTheme::kKbNames[i], in.rgb[i]);
-                    if (!bad.empty()) return RefuseHostTheme(id, bad);
-                    std::string why;
-                    if (!HostTheme::ResolveKeyboard(in, kb, why, &notes)) return RefuseHostTheme(id, "keyboard: " + why);
-                    kbPart = Part::Set;
+                    std::string resolveWhy;
+                    if (!bad.empty()) refusePart(kbRefused, bad);
+                    else if (!HostTheme::ResolveKeyboard(in, kb, resolveWhy, &notes)) refusePart(kbRefused, "keyboard: " + resolveWhy);
+                    else kbPart = Part::Set;
                 }
             }
+            bad.clear();
             if (const auto c = j.find("cursor"); c != j.end()) {
                 if (c->is_null()) {
                     cursorPart = Part::Clear;
                 } else if (!c->is_object()) {
-                    return RefuseHostTheme(id, "\"cursor\" must be an object or null");
+                    refusePart(cursorRefused, "\"cursor\" must be an object or null");
                 } else {
                     std::uint32_t* const slots[] = { &tint.lit, &tint.shade, &tint.ink, &tint.glow, &tint.ibeam };
                     static_assert(std::size(slots) == HostTheme::kCursorNames.size());
@@ -1227,14 +1253,15 @@ namespace Magelight {
                         std::uint32_t rgb = 0;
                         if (colour(*c, "cursor", HostTheme::kCursorNames[i], rgb)) *slots[i] = 0xFF000000u | rgb;
                     }
-                    if (!bad.empty()) return RefuseHostTheme(id, bad);
-                    cursorPart = Part::Set;   // a colour left out keeps the host's, as in CursorTint
+                    if (!bad.empty()) refusePart(cursorRefused, bad);
+                    else cursorPart = Part::Set;   // a colour left out keeps the host's, as in CursorTint
                 }
             }
         }
         // Both parts in one critical section. The cursor part is SetViewCursorTint's store without its per-call log
         // line; the one line here is built from what is stored and written after unlocking.
         std::string line;
+        bool logIt = false;
         {
             std::lock_guard<std::mutex> lk(s_viewsMutex);
             MlView* v = FindViewLocked(id);
@@ -1251,14 +1278,23 @@ namespace Magelight {
                 v->cursorTint = tint;
             }
             std::uint32_t skipped = 0;
-            if ((!kbChanged && !cursorChanged) || !v->themeLog.Admit(GetTickCount64(), skipped)) return;
-            if (kbChanged)
-                line = "keyboard " + (v->kbTheme ? HostTheme::KeyboardJson(*v->kbTheme) : std::string("none (the host's look)"));
-            if (cursorChanged) line += std::string(line.empty() ? "" : "; ") + "cursor tint " + DescribeCursorTint(v->cursorTint);
-            if (kbChanged && !notes.empty()) line += "; " + notes;
-            else notes.clear();
-            if (skipped) line += " (" + std::to_string(skipped) + " earlier changes not logged)";
+            logIt = (kbChanged || cursorChanged) && v->themeLog.Admit(GetTickCount64(), skipped);
+            if (logIt) {
+                if (kbChanged)
+                    line = "keyboard " + (v->kbTheme ? HostTheme::KeyboardJson(*v->kbTheme) : std::string("none (the host's look)"));
+                if (cursorChanged) line += std::string(line.empty() ? "" : "; ") + "cursor tint " + DescribeCursorTint(v->cursorTint);
+                if (kbChanged && !notes.empty()) line += "; " + notes;
+                else notes.clear();
+                if (skipped) line += " (" + std::to_string(skipped) + " earlier changes not logged)";
+            }
         }
+        if (reply) {
+            const auto status = [](Part part, bool refused) {
+                return refused ? "refused" : part == Part::Set ? "set" : part == Part::Clear ? "cleared" : "kept";
+            };
+            ReplyHostTheme(id, status(kbPart, kbRefused), status(cursorPart, cursorRefused), why);
+        }
+        if (!logIt) return;
         if (!notes.empty()) SKSE::log::warn("Magelight: view {} hostTheme (page): {}", id, line);
         else SKSE::log::info("Magelight: view {} hostTheme (page): {}", id, line);
     }
@@ -7639,9 +7675,43 @@ float4 ps_straight(VSOut i) : SV_Target {
 
     void EnterUIMode(ViewId view) { EnterUIModeEx(view, false); }
 
-    void EnterUIModeEx(ViewId view, bool pauseGame, bool noTextEntry)
+    // Posted UI-mode entries and exits that have not run yet (1.1.0). Any thread; a leaf lock, never held while
+    // taking another.
+    static std::mutex s_uiTicketMutex;
+    static std::unordered_set<std::uint64_t> s_uiTickets;
+    static std::uint64_t s_uiTicketSeq = 0;   // under s_uiTicketMutex
+
+    std::uint64_t NewUIModeTicket()
     {
-        GameTask::Post([view, pauseGame, noTextEntry]() {
+        std::lock_guard<std::mutex> lk(s_uiTicketMutex);
+        const std::uint64_t ticket = ++s_uiTicketSeq;
+        s_uiTickets.insert(ticket);
+        return ticket;
+    }
+
+    bool CancelUIModeTicket(std::uint64_t ticket)
+    {
+        if (!ticket) return false;
+        std::lock_guard<std::mutex> lk(s_uiTicketMutex);
+        return s_uiTickets.erase(ticket) != 0;
+    }
+
+    // Game thread, first thing in a ticketed task: false when the ticket was withdrawn before the task ran.
+    static bool TakeUIModeTicket(std::uint64_t ticket)
+    {
+        if (!ticket) return true;
+        std::lock_guard<std::mutex> lk(s_uiTicketMutex);
+        return s_uiTickets.erase(ticket) != 0;
+    }
+
+    void EnterUIModeEx(ViewId view, bool pauseGame, bool noTextEntry, std::uint64_t ticket)
+    {
+        GameTask::Post([view, pauseGame, noTextEntry, ticket]() {
+            if (!TakeUIModeTicket(ticket)) {
+                // Withdrawn by CancelUIModeRequest: no entry, and so no UIModeEntered or UIModeRefused.
+                SKSE::log::info("Magelight: EnterUIMode({}) withdrawn before it ran", view);
+                return;
+            }
             if (s_focused.load()) {
                 // One surface at a time — callers gate on IsUIModeActive()
                 // (SA's mutual-exclusion contract); refuse rather than steal.
@@ -7671,12 +7741,19 @@ float4 ps_straight(VSOut i) : SV_Target {
         });
     }
 
-    void ExitUIMode()
+    void ExitUIMode(std::uint64_t ticket)
     {
         // Deliberately does NOT hide the view (Magelight.h contract — SA's
         // Free Look keeps the view rendered while the game owns input;
         // callers that want a hide pair this with ShowView(view, false)).
-        GameTask::Post([]() { SetUIMode(false, /*hideView=*/false); });
+        GameTask::Post([ticket]() {
+            if (!TakeUIModeTicket(ticket)) {
+                // Reclaimed by its own mod's next request (kUIModeFlagReclaim): UI mode stays, no UIModeExited.
+                SKSE::log::info("Magelight: ExitUIMode withdrawn before it ran (the holder asked again)");
+                return;
+            }
+            SetUIMode(false, /*hideView=*/false);
+        });
     }
 
     bool IsUIModeActive()

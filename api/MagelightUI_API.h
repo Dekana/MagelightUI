@@ -317,6 +317,14 @@ namespace MAGELIGHT_API {
                                                             // fields (a radial, a yes/no card): on Skyrim VR the
                                                             // gate starts the engine's virtual keyboard device,
                                                             // which OpenComposite hooks to raise ITS keyboard.
+    inline constexpr std::uint32_t kUIModeFlagReclaim = 8;  // (1.1.0) your own ReleaseUIMode has not run yet:
+                                                            // withdraw it and keep the mode (retargeted to this
+                                                            // view and pause) instead of losing it to that exit.
+                                                            // No UIModeExited for the withdrawn release, and a
+                                                            // UIModeEntered ("switched") confirms the reclaim,
+                                                            // the same view included. Re-show a view you hid with
+                                                            // the release. Ignored before 1.1.0 (gate on
+                                                            // "uiModeCancel").
 
     // ── VR (0.18.0) ────────────────────────────────────────────────────────
     // Per-view placement in the headset. mode: 0 HeadLocked (glued to the head
@@ -498,7 +506,7 @@ namespace MAGELIGHT_API {
         void   (*GetDisplaySize)(std::int32_t* w, std::int32_t* h);   // 0,0 before the first frame
         std::int32_t (*QueryCapability)(const char* name);  // 1/0. Case-insensitive here. The authoritative
                                                             // name list is QueryCapability() in the host; as of
-                                                            // 0.31.9: "gpu" "textureImage" "clipPathHole"
+                                                            // 1.1.0: "gpu" "textureImage" "clipPathHole"
                                                             // "pause" "events" "clipboard" "networkDeny"
                                                             // "sessions" "manifest" "http" "vr" "hotkeys"
                                                             // "evaljs" "pagebridge" "cutout" "hibernate"
@@ -511,7 +519,8 @@ namespace MAGELIGHT_API {
                                                             // errors, 3 all) "loadStagger" "loadOnShow"
                                                             // "cursor" (0.31.0) "cursorTint" (0.31.1) "csp"
                                                             // (0.31.5) "rebuildScale" (0.31.7)
-                                                            // "keyboardTheme" (0.31.9), "prepaint" (0.31.11). The
+                                                            // "keyboardTheme" (0.31.9), "prepaint" (0.31.11),
+                                                            // "uiModeCancel" "hostThemeReply" (1.1.0). The
                                                             // page-injected window.__MAGELIGHT__.capabilities
                                                             // (SDK: host.can) and the SDK mock carry this same
                                                             // set under the camelCase spellings shown (the page
@@ -752,6 +761,18 @@ namespace MAGELIGHT_API {
         // set the same flag with magelight.send('__prepaint', '1'). Any thread;
         // InvalidView for a view that is gone or an inspector.
         Result (*SetViewPrepaint)(ViewId view, bool on);
+
+        // ── appended in 1.1.0 — gate on hostVersionNumber >= 10100 and QueryCapability("uiModeCancel") ──
+        // Withdraw your RequestUIMode whose entry the host has not run yet
+        // (RequestUIMode only queues it), and your kUIModeFlagQueue requests:
+        // Ok = withdrawn, and no UIModeEntered or UIModeRefused follows for
+        // it, so a close right after an open needs no give-back. Denied = no
+        // entry of yours can be withdrawn: it already ran and its
+        // UIModeEntered or UIModeRefused is on its way (leave UI mode with
+        // ReleaseUIMode once it is entered), or there was none. Call it BEFORE
+        // ReleaseUIMode: a release while the entry waits forgets it (as before
+        // 1.1.0, the entry still runs) and this then answers Denied. Any thread.
+        Result (*CancelUIModeRequest)(ModId mod);
     };
 
     inline constexpr std::uint32_t PackVersion(std::uint32_t major, std::uint32_t minor, std::uint32_t patch)

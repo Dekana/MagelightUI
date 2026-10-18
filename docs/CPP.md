@@ -273,6 +273,28 @@ UI-mode enter/exit with zero page code; it is off unless you ask. There is
 deliberately no file playback: a loose `.wav` path would be a new attack
 surface (SECURITY.md) and would bypass the audio settings.
 
+## A quick close and reopen (1.1.0)
+
+`RequestUIMode` and `ReleaseUIMode` only queue the entry or the exit: the host runs it on a later
+game-thread task, and a busy frame (a page's first parse, a save's load) can hold it for hundreds of
+milliseconds. Two orders catch a mod that closes and reopens quickly:
+
+- **A close before the entry ran.** `ReleaseUIMode` withdraws nothing that has not entered: it returns
+  `Ok` and the entry still runs, so the mod gets a `UIModeEntered` it no longer wants and has to give the
+  mode back. Call `CancelUIModeRequest(mod)` instead, before any `ReleaseUIMode`: `Ok` means the entry
+  (and any `kUIModeFlagQueue` request of yours) was withdrawn, and no `UIModeEntered` or `UIModeRefused`
+  follows for it. `Denied` means it already ran: its event is on its way, and you release once it is
+  entered, as before.
+- **A reopen before the exit ran.** A `RequestUIMode` from the mod that still holds the mode retargets it
+  in place and returns `Ok`, and then the release's queued exit takes the mode away (`UIModeExited`).
+  Add `kUIModeFlagReclaim` to the reopen: your release that has not run is withdrawn and the mode is kept,
+  retargeted to the new view and pause, with no `UIModeExited` for that release; a `UIModeEntered`
+  "switched" confirms it, the same view included. A view you hid with the release needs `ShowView(view, true)`.
+
+Both are opt-in: a mod that never calls `CancelUIModeRequest` or passes the flag sees the earlier
+behaviour, events included. Gate on `hostVersionNumber >= 10100` and `QueryCapability("uimodecancel") == 1`;
+an older host ignores the flag.
+
 ## Device scale and the pause retarget
 
 - **Real DPI (0.26.9).** `ViewDesc::uiScale` is Ultralight's device scale:
@@ -562,7 +584,10 @@ Contrast is WCAG 2's ratio. Labels are held to 3:1 on both `key` and
   is stored there and never shown, so set it unconditionally.
 - A page can set the same slot itself with `magelight.hostTheme({ v: 1,
   keyboard: { ... } })` ([SDK.md](SDK.md)), with the same rules, and the
-  cursor tint in the same message. Whichever of you sets it last wins.
+  cursor tint in the same message. Whichever of you sets it last wins. From
+  1.1.0 a part with a bad value is refused alone: the other part of the
+  message still applies, and a page that asks gets a reply saying which part
+  was refused and why.
 - The keyboard page is privileged (its keys go to the UI-mode view), so it
   never sees what you or a page passed: the host checks the colours, builds a
   fresh message from the numbers, and the page checks each value again.

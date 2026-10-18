@@ -102,6 +102,12 @@ namespace Magelight::Api4 {
         // The image base of s_uiOwner's DLL, for the polled-key filter, which runs on any thread and must not lock.
         std::atomic<const void*> s_uiOwnerModule{ nullptr };
         ViewId s_uiPending = 0;   // a RequestUIMode whose game-thread entry has not been decided yet
+        // The posted entry of s_uiPending, set with it under s_mutex, so CancelUIModeRequest can withdraw it (1.1.0).
+        std::uint64_t s_uiPendingTicket = 0;
+        // The posted exit of the holder's last ReleaseUIMode, until UIModeExited; a kUIModeFlagReclaim request of
+        // that mod withdraws it (1.1.0).
+        std::uint64_t s_uiExitTicket = 0;
+        ModId s_uiExitMod = 0;
         bool s_sinkInstalled = false;
 
         // kUIModeFlagQueue: requests waiting for the holder to release, FIFO.
@@ -432,7 +438,7 @@ namespace Magelight::Api4 {
                         m->views.erase(view);
                     }
                     s_viewOwner.erase(view);
-                    if (s_uiPending == view) s_uiPending = 0;
+                    if (s_uiPending == view) { s_uiPending = 0; s_uiPendingTicket = 0; }
                     DropQueuedLocked(view);
                     DropHotkeysLocked(view);
                     break;
@@ -446,7 +452,7 @@ namespace Magelight::Api4 {
                     // The host decided: the entered view's owner (0 for a host/v3 view) holds UI mode.
                     s_uiOwner = OwnerLocked(view);
                     PublishUiOwnerLocked();
-                    if (s_uiPending == view || s_uiPending != 0) s_uiPending = 0;
+                    if (s_uiPending == view || s_uiPending != 0) { s_uiPending = 0; s_uiPendingTicket = 0; }
                     if (Mod* m = FindLocked(s_uiOwner)) targets.emplace_back(SinkOf(*m), Event::UIModeEntered);
                     break;
                 case HostEvent::UIModeExited:
@@ -454,10 +460,13 @@ namespace Magelight::Api4 {
                     s_uiOwner = 0;
                     PublishUiOwnerLocked();
                     s_uiPending = 0;
+                    s_uiPendingTicket = 0;
+                    s_uiExitTicket = 0;
+                    s_uiExitMod = 0;
                     if (!s_uiQueue.empty()) drainQueue = true;
                     break;
                 case HostEvent::UIModeRefused:
-                    if (s_uiPending == view) s_uiPending = 0;
+                    if (s_uiPending == view) { s_uiPending = 0; s_uiPendingTicket = 0; }
                     ownerSink(view, Event::UIModeRefused);
                     break;
                 case HostEvent::DisplayResized:
@@ -719,7 +728,7 @@ namespace Magelight::Api4 {
     void UnregisterMod(ModId mod)
     {
         std::vector<ViewId> views;
-        bool ownsUi = false;
+        bool ownsUi = false, drainAfter = false;
         {
             std::lock_guard<std::mutex> lk(s_mutex);
             Mod* m = FindLocked(mod);
@@ -727,7 +736,16 @@ namespace Magelight::Api4 {
             m->alive->store(false);   // queued deliveries drop
             for (const auto& [v, rec] : m->views) { views.push_back(v); DropQueuedLocked(v); DropHotkeysLocked(v); }
             ownsUi = (s_uiOwner == mod);
-            if (ownsUi) { s_uiOwner = 0; s_uiPending = 0; PublishUiOwnerLocked(); }
+            if (ownsUi) { s_uiOwner = 0; s_uiPending = 0; s_uiPendingTicket = 0; PublishUiOwnerLocked(); }
+            // An entry of this mod that has not run would enter a view the destroys below then cannot remove
+            // (DestroyView refuses the UI-mode view), leaving UI mode to a mod that no longer exists.
+            if (s_uiPending && OwnerLocked(s_uiPending) == mod) {
+                Magelight::CancelUIModeTicket(s_uiPendingTicket);
+                s_uiPending = 0;
+                s_uiPendingTicket = 0;
+                drainAfter = !s_uiQueue.empty();
+            }
+            if (s_uiExitMod == mod) { s_uiExitTicket = 0; s_uiExitMod = 0; }
             SKSE::log::info("Magelight[v4]: mod {} ('{}') unregistered — {} view(s) queued for destruction",
                 mod, m->modId, views.size());
             s_mods.erase(mod);
@@ -737,6 +755,7 @@ namespace Magelight::Api4 {
         // Exit is a game-thread task; the destroys must run AFTER it or the
         // host refuses to destroy the active UI-mode view. Tasks are FIFO.
         if (ownsUi) Magelight::ExitUIMode();
+        if (drainAfter) Magelight::GameTask::Post([]() { DrainUIQueue(); });
         Magelight::GameTask::Post([views]() {
             for (ViewId v : views) {
                 if (!Magelight::DestroyView(v))
@@ -858,10 +877,19 @@ namespace Magelight::Api4 {
             return Fail(owner, Result::Denied, "RequestUIMode: a Hud / click-through view cannot take UI mode");
 
         Sink holder;
-        bool busy = false, haveHolder = false, switching = false, queued = false;
+        bool busy = false, haveHolder = false, switching = false, queued = false, reclaimed = false;
+        std::uint64_t ticket = 0;
         {
             std::lock_guard<std::mutex> lk(s_mutex);
             const bool active = Magelight::IsUIModeActive();
+            // kUIModeFlagReclaim: this mod's own release has not run yet. Withdraw it, so the request below keeps
+            // the mode it still holds instead of retargeting it and losing it to that exit a moment later.
+            if ((flags & kUIModeFlagReclaim) && active && s_uiOwner == owner && s_uiExitTicket != 0 &&
+                s_uiExitMod == owner && Magelight::CancelUIModeTicket(s_uiExitTicket)) {
+                s_uiExitTicket = 0;
+                s_uiExitMod = 0;
+                reclaimed = true;
+            }
             if (active && s_uiOwner == owner && s_uiPending == 0) {
                 switching = true;   // intra-mod: retarget the mode you already hold
             } else if (active || s_uiOwner != 0 || s_uiPending != 0) {
@@ -875,17 +903,21 @@ namespace Magelight::Api4 {
                 }
             } else {
                 s_uiPending = view;   // decided by the host on the game thread; Entered/Refused clears it
+                ticket = Magelight::NewUIModeTicket();
+                s_uiPendingTicket = ticket;
             }
         }
+        if (reclaimed) SKSE::log::info("Magelight[v4]: RequestUIMode({}) reclaimed UI mode from its own release", view);
         if (switching) {
             // 0.26.10: a re-request carries the flags the holder wants NOW —
             // the pause flag is retargeted even when the view is unchanged
             // (before, a same-view re-request returned Ok and silently kept
             // the old pause: SA's Live Stage asked to unpause and ran frozen).
             const bool wantPause = (flags & kUIModeFlagPause) != 0;
-            if (Magelight::GetUIModeView() != view) Magelight::SwitchUIModeView(view);
+            // A reclaim always confirms, the same view included: the mod's close already told it the mode was going.
+            if (reclaimed || Magelight::GetUIModeView() != view) Magelight::SwitchUIModeView(view);
             Magelight::SetUIModePause(wantPause);
-            return Result::Ok;   // UIModeEntered (detail "switched") confirms a view change
+            return Result::Ok;   // UIModeEntered (detail "switched") confirms a view change or a reclaim
         }
         if (busy) {
             std::string requester;
@@ -899,13 +931,47 @@ namespace Magelight::Api4 {
             return Fail(owner, Result::Busy, "RequestUIMode: UI mode is held by " +
                 (haveHolder ? holder.modId : std::string("the host or a v3 consumer")));
         }
-        Magelight::EnterUIModeEx(view, (flags & kUIModeFlagPause) != 0, (flags & kUIModeFlagNoTextEntry) != 0);
+        Magelight::EnterUIModeEx(view, (flags & kUIModeFlagPause) != 0, (flags & kUIModeFlagNoTextEntry) != 0, ticket);
         return Result::Ok;   // UIModeEntered confirms; UIModeRefused reports a lost race
     }
 
-    Result ReleaseUIMode(ModId mod)
+    Result CancelUIModeRequest(ModId mod)
+    {
+        bool withdrawn = false, dropped = false, drain = false;
+        {
+            std::lock_guard<std::mutex> lk(s_mutex);
+            Mod* m = FindLocked(mod);
+            if (!m) return Result::InvalidMod;
+            const std::size_t queuedBefore = s_uiQueue.size();
+            for (const auto& [v, rec] : m->views) DropQueuedLocked(v);
+            dropped = s_uiQueue.size() != queuedBefore;
+            // The ticket was set with s_uiPending under this lock, so a pending entry always has one; a false
+            // CancelUIModeTicket means the entry task already ran and its Entered or Refused is on its way.
+            const bool hadEntry = s_uiPending && OwnerLocked(s_uiPending) == mod;
+            if (hadEntry && Magelight::CancelUIModeTicket(s_uiPendingTicket)) {
+                s_uiPending = 0;
+                s_uiPendingTicket = 0;
+                withdrawn = true;
+                drain = !s_uiQueue.empty();
+            }
+            // Ok promises no Entered or Refused follows: never while an entry of this mod is still coming, even
+            // when queued requests were dropped (they stay dropped).
+            if (hadEntry ? !withdrawn : !dropped) {
+                m->lastError = "CancelUIModeRequest: no request of this mod is waiting (an entry that already ran is "
+                               "confirmed by UIModeEntered or UIModeRefused; leave it with ReleaseUIMode)";
+                return Result::Denied;
+            }
+        }
+        if (drain) Magelight::GameTask::Post([]() { DrainUIQueue(); });
+        return Result::Ok;
+    }
+
+    // reclaimable: the mod's own release, which its next kUIModeFlagReclaim request may withdraw. A close the
+    // player made (the toggle key) is never reclaimable: a mod's request must not undo it.
+    static Result ReleaseUIModeAs(ModId mod, bool reclaimable)
     {
         bool active = Magelight::IsUIModeActive();
+        std::uint64_t ticket = 0;
         {
             std::lock_guard<std::mutex> lk(s_mutex);
             Mod* m = FindLocked(mod);
@@ -915,16 +981,32 @@ namespace Magelight::Api4 {
             if (!active) {
                 // Nothing to exit; make sure no stale claim survives.
                 if (s_uiOwner == mod) { s_uiOwner = 0; PublishUiOwnerLocked(); }
-                if (s_uiPending && OwnerLocked(s_uiPending) == mod) s_uiPending = 0;
+                if (s_uiPending && OwnerLocked(s_uiPending) == mod) { s_uiPending = 0; s_uiPendingTicket = 0; }
                 return Result::Ok;
             }
             if (s_uiOwner != mod) {
                 m->lastError = "ReleaseUIMode: this mod does not own UI mode";
                 return Result::Denied;
             }
+            // This mod's release is already queued: one exit is enough, and a second ticket would leave the first
+            // exit for a later reclaim to miss.
+            if (reclaimable && s_uiExitTicket != 0 && s_uiExitMod == mod) return Result::Ok;
+            if (reclaimable) {
+                ticket = Magelight::NewUIModeTicket();
+                s_uiExitTicket = ticket;
+                s_uiExitMod = mod;
+            } else {
+                s_uiExitTicket = 0;   // a mod's earlier release is no longer the one that will run
+                s_uiExitMod = 0;
+            }
         }
-        Magelight::ExitUIMode();   // UIModeExited clears the owner
+        Magelight::ExitUIMode(ticket);   // UIModeExited clears the owner
         return Result::Ok;
+    }
+
+    Result ReleaseUIMode(ModId mod)
+    {
+        return ReleaseUIModeAs(mod, true);
     }
 
     ModId GetUIModeOwner()
@@ -1023,6 +1105,8 @@ namespace Magelight::Api4 {
         if (n == "rebuildscale") return 1;  // RebuildViewAtScale (0.31.7)
         if (n == "keyboardtheme") return 1; // SetViewKeyboardTheme / magelight.hostTheme (0.31.9)
         if (n == "prepaint") return 1;      // SetViewPrepaint / __prepaint / manifest "prepaint" (0.31.11)
+        if (n == "uimodecancel") return 1;  // CancelUIModeRequest / kUIModeFlagReclaim (1.1.0)
+        if (n == "hostthemereply") return 1; // hostTheme per-part refusal and its "reply" (1.1.0)
         if (n == "inspector") return (Magelight::DevModeEnabled() && Magelight::InspectorAvailable()) ? 1 : 0;
         return 0;
     }
@@ -1135,7 +1219,8 @@ namespace Magelight::Api4 {
                                         "pagebridge", "cutout", "hibernate", "inspector", "ime",
                                         "loopback", "csp", "escapeCapture", "viewOrder", "scrollStep", "networkPolicy",
                                         "sound", "freezeWorld", "consoleLog", "loadStagger", "loadOnShow", "cursor",
-                                        "cursorTint", "rebuildScale", "keyboardTheme", "prepaint" };
+                                        "cursorTint", "rebuildScale", "keyboardTheme", "prepaint", "uiModeCancel",
+                                        "hostThemeReply" };
         std::string out = "{";
         bool first = true;
         for (const char* n : kNames) {
@@ -1624,7 +1709,7 @@ namespace Magelight::Api4 {
                 // letter typed into a text field must never open another
                 // mod's panel. Other bindings are swallowed.
                 if (Magelight::GetUIModeView() == hk.view) {
-                    const Result r = ReleaseUIMode(OwnerOf(hk.view));
+                    const Result r = ReleaseUIModeAs(OwnerOf(hk.view), false);
                     if (r != Result::Ok)
                         SKSE::log::warn("Magelight[v4]: hotkey close refused — {}", GetLastErrorMessage(OwnerOf(hk.view)));
                     // A toggle key's close means HIDE. ReleaseUIMode alone keeps

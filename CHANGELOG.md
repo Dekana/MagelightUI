@@ -13,6 +13,8 @@ The **"added in"** column is the version to put in `minHost` (manifest) /
 
 | Added | Gate | Feature |
 |---|---|---|
+| 1.1.0 | 10100 | `CancelUIModeRequest(mod)` — withdraw your UI-mode entry the host has not run yet (and your queued requests), with no `UIModeEntered` or `UIModeRefused` for it; `kUIModeFlagReclaim` on `RequestUIMode` — withdraw your own release that has not run and keep the mode; `QueryCapability("uimodecancel")` |
+| 1.1.0 | 10100 | `magelight.hostTheme`: a part with a bad value is refused alone (the other still applies), and `reply: true` answers on the `__hostthemeresult` channel; `QueryCapability("hostthemereply")` |
 | 1.0.0 | 10000 | No new API: 0.31.11's host under a stable version. Every gate above holds (10000 is above each packed number), and the npm packages follow at 1.0.0 |
 | 0.31.11 | 3111 | `SetViewPrepaint(view, on)` — paint a hidden view once about 1.5 s after its DOM ready (again after a reload or resize), so its first show composites a finished page; page `magelight.send('__prepaint', '1')`; manifest `"prepaint"`; never in VR; `QueryCapability("prepaint")` |
 | 0.31.9 | 3109 | `SetViewKeyboardTheme(view, theme)` with `KeyboardTheme` — Magelight's own VR keyboard in a view's colours while it holds UI mode (eight required colours, five filled in, text under 3:1 refused); page `magelight.hostTheme({ v: 1, keyboard, cursor })` sets the keyboard theme and the cursor tint; `QueryCapability("keyboardtheme")` |
@@ -46,6 +48,27 @@ The **"added in"** column is the version to put in `minHost` (manifest) /
 | 0.12.0 | — | `BindHotkey` registry; manifest `hotkey` |
 | 0.11.0 | — | Sessions / manifest docs |
 | 0.10.0 | — | API v4 (`MagelightApi4`): per-mod registration, texture images, UI mode, events |
+
+## 1.1.0
+
+- **A quick close and reopen no longer need repairing afterwards.** `RequestUIMode` and `ReleaseUIMode`
+  only queue the entry or the exit, so a mod that closed before its entry ran still got a `UIModeEntered`
+  and had to give the mode back, and one that reopened before its exit ran retargeted the mode and then
+  lost it to that exit. `CancelUIModeRequest(mod)` withdraws an entry that has not run (and the mod's
+  `kUIModeFlagQueue` requests), and no `UIModeEntered` or `UIModeRefused` follows for it; `Denied` says it
+  already ran. `kUIModeFlagReclaim` on a `RequestUIMode` withdraws the mod's own release that has not run,
+  so it keeps the mode, retargeted, with no `UIModeExited`. Both are opt-in: a mod that uses neither sees
+  the earlier behaviour, events included. Gate on 10100 and `QueryCapability("uimodecancel")`. The log
+  notes each withdrawal.
+- **A page theme's bad keyboard no longer drops its cursor tint.** `magelight.hostTheme` refused the
+  whole message for one bad value, so a keyboard that failed the contrast rules also lost the cursor
+  colours sent with it, and the page could not tell. A part with a bad value is now refused alone and the
+  other part applies; a message that asks with `reply: true` is answered on the `__hostthemeresult`
+  channel with each part's outcome and the reason for a refusal, and nothing is sent to a page that does
+  not ask. `QueryCapability("hostthemereply")`, page `capabilities.hostThemeReply`.
+- **The npm packages stay at 1.0.0** until their next publish, which carries `HostTheme.reply`, the
+  `HostThemeResult` type and the SDK mock's two new capabilities; a page reads the reply today with
+  `magelight.on` (the payload is JSON text) or the SDK's `bridge.on`.
 
 ## 1.0.0
 

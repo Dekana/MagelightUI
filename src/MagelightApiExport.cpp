@@ -148,6 +148,8 @@ namespace {
         &Magelight::Api4::SetViewKeyboardTheme,
         // 0.31.11 appendix
         &Magelight::Api4::SetViewPrepaint,
+        // 1.1.0 appendix
+        &Magelight::Api4::CancelUIModeRequest,
     };
 
 }  // namespace

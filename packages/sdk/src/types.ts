@@ -29,7 +29,7 @@ export interface PageCore {
   hostTheme?(theme: HostTheme | null): void;
 }
 
-/** `#rrggbb`, exactly: opaque, no shorthand, no alpha. Anything else refuses the whole theme. */
+/** `#rrggbb`, exactly: opaque, no shorthand, no alpha. Anything else refuses its part (host 1.1.0+; the whole theme before). */
 export type HexColor = `#${string}`;
 
 /**
@@ -68,12 +68,23 @@ export interface CursorThemeColors {
 
 /**
  * What `magelight.hostTheme` sends. Each part: an object sets it, `null` clears it, left out keeps it.
- * One bad value refuses the whole message (the reason is in Magelight.log); at most 2 KB as JSON.
+ * From host 1.1.0 a bad value refuses only its part (before, the whole message); the reason is in
+ * Magelight.log. At most 2 KB as JSON.
  */
 export interface HostTheme {
   v: 1;
   keyboard?: KeyboardThemeColors | null;
   cursor?: CursorThemeColors | null;
+  /** Host 1.1.0 (`capabilities.hostThemeReply`): answer on the `__hostthemeresult` channel (`HostThemeResult`). */
+  reply?: boolean;
+}
+
+/** What a host 1.1.0+ sends on `__hostthemeresult` for a `hostTheme` message with `reply: true`. */
+export interface HostThemeResult {
+  keyboard: 'set' | 'cleared' | 'kept' | 'refused';
+  cursor: 'set' | 'cleared' | 'kept' | 'refused';
+  /** Why the first refused part was refused. */
+  why?: string;
 }
 
 declare global {

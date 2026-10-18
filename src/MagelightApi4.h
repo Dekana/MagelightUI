@@ -36,6 +36,7 @@ namespace Magelight::Api4 {
     Result RegisterJSListenerEx(ViewId view, const char* name, MAGELIGHT_API::JsListenerFn4 cb, void* user);
     Result RequestUIMode(ViewId view, std::uint32_t flags);
     Result ReleaseUIMode(ModId mod);
+    Result CancelUIModeRequest(ModId mod);
     ModId  GetUIModeOwner();
     // Image base of the DLL whose mod holds UI mode (nullptr: none, or a v1-v3/host view). Lock-free, any thread.
     const void* GetUIModeOwnerModule();
