@@ -101,6 +101,8 @@ namespace Magelight {
     //                              // log (unset: "all" in devMode, else "warnings")
     //   "stallWatchdog": true, "stallThresholdMs": 1500   // 0.28.3: log the stalled thread's stack when no
     //                                                     // frame presents this long (250-60000)
+    //   "exceptionTelemetry": true   // log the first severe exception at each address, with its stack (false =
+    //                                // no exception handler at all; see VectoredLogger)
     //   "blockPolledKeys": true   // 0.31.10: other plugins' GetAsyncKeyState / GetKeyState read keys as up while a
     //                             // page holds UI mode (see InstallPolledKeyFilter)
     //   "loadStagger": true, "loadBudgetMs": 8   // 0.31.0: hidden views start their first load one per frame
@@ -265,6 +267,8 @@ namespace Magelight {
     static std::atomic<long long> s_lastPresentMs{ 0 };
     static std::atomic<DWORD>     s_lastPresentTid{ 0 };
     static std::atomic<bool>      s_stallWatchdog{ true };
+    // Magelight.json "exceptionTelemetry": false takes the fault logger (VectoredLogger) out of the chain.
+    static std::atomic<bool>      s_exceptionTelemetry{ true };
     static bool                   s_blockPolledKeys = true;   // Magelight.json; read before InstallPolledKeyFilter
     static std::atomic<int>       s_stallThresholdMs{ 1500 };
     // Staggered view loading (0.31.0, MaterializeViews): "loadStagger" and "loadBudgetMs" in Magelight.json.
@@ -531,6 +535,8 @@ namespace Magelight {
                 s_imageProbe = it->get<bool>();
             if (auto it = j.find("stallWatchdog"); it != j.end() && it->is_boolean())
                 s_stallWatchdog.store(it->get<bool>());
+            if (auto it = j.find("exceptionTelemetry"); it != j.end() && it->is_boolean())
+                s_exceptionTelemetry.store(it->get<bool>());
             if (auto it = j.find("blockPolledKeys"); it != j.end() && it->is_boolean())
                 s_blockPolledKeys = it->get<bool>();
             if (auto it = j.find("stallThresholdMs"); it != j.end() && it->is_number())
@@ -553,9 +559,10 @@ namespace Magelight {
                 s_modCursors.store(it->get<bool>());
             static constexpr const char* kConsoleLogNames[] = { "none", "errors", "warnings", "all" };
             SKSE::log::info("Magelight: settings loaded (toggleKey={}, demoViews={}, imageProbe={}, devMode={}, consoleLog={}, "
-                            "loadStagger={}, loadBudgetMs={}, cursorForce={}, modCursors={}, msaa={})",
+                            "loadStagger={}, loadBudgetMs={}, cursorForce={}, modCursors={}, msaa={}, exceptionTelemetry={})",
                 s_toggleKey.load(), s_demoViews, s_imageProbe, s_devMode.load(), kConsoleLogNames[ConsoleLogLevel()],
-                s_loadStagger.load(), s_loadBudgetMs.load(), s_cursorForce.load(), s_modCursors.load(), s_msaa);
+                s_loadStagger.load(), s_loadBudgetMs.load(), s_cursorForce.load(), s_modCursors.load(), s_msaa,
+                s_exceptionTelemetry.load());
         } catch (...) {
             SKSE::log::warn("Magelight: Magelight.json unreadable — defaults in effect");
         }
@@ -2958,34 +2965,50 @@ namespace Magelight {
     // caught faults alone.
     static thread_local bool t_walkingStack = false;
 
-    // One report per distinct fault site for the life of the process. A count cap spent itself on the first mod
-    // that faults in a loop (eight lines in one millisecond from one module), and every later fault went
-    // unlogged. Keyed on (code, raw address) before any module lookup: a repeat costs a table scan, not the
-    // loader lock, and faults in module-less memory (JIT code, a call through null) stay distinct. Lock-free;
-    // two threads racing on one new site may each report it. A slot's addr is written before its code (release),
-    // so a reader that sees the code sees the addr: a half-written slot has code 0 and matches nothing.
+    // One report per distinct fault site for the life of the process, keyed on (code, raw address): a repeat costs
+    // a table scan, and faults in module-less memory (JIT code, a call through null) stay distinct. Lock-free; two
+    // threads racing on one new site may each claim a slot.
+    //
+    // The handler runs first for every severe exception in the process, the real crash included, before
+    // CrashLogger, so it takes no lock of its own, touches no heap and never asks the loader (the unwinder uses the
+    // same function-table lookups exception dispatch makes): it fills its slot (the fault and the faulting thread's
+    // callers), wakes the watchdog thread (s_faultEvent) and returns. That thread formats and logs the slot
+    // (DrainFaultReports). Logging from
+    // the handler hung a thread that faulted inside Magelight's own logging (the log's lock is that thread's), and
+    // a fault while logging on a damaged heap re-entered the handler.
+    // A slot is claimed (addr, then code, release), filled, then marked ready (release); the drain reads it only
+    // once ready.
+    static constexpr int kVehStackFrames = 24;
     struct SeenFault {
         std::atomic<std::uint32_t>  code{ 0 };
         std::atomic<std::uintptr_t> addr{ 0 };
+        std::atomic<bool>           ready{ false };
+        bool                        logged = false;   // drain thread only
+        DWORD                       tid = 0;
+        bool                        overflow = false;
+        bool                        callerFirst = false;   // a call through null: frames[0] is its caller
+        int                         frameCount = 0;
+        void*                       frames[kVehStackFrames]{};
     };
     static constexpr int kMaxSeenFaults = 64;
     static SeenFault         s_seenFaults[kMaxSeenFaults];
     static std::atomic<int>  s_seenFaultCount{ 0 };
     static std::atomic<bool> s_seenFaultsFull{ false };
 
-    // A stack overflow on a thread with too little stack left to format a line is parked here and logged by
-    // the stall watchdog's thread (DrainParkedOverflow): logging on the exhausted stack would overflow it again,
-    // which kills the process, a handled overflow included.
-    static std::atomic<bool>           s_overflowParked{ false };
-    static std::atomic<std::uintptr_t> s_overflowAddr{ 0 };
-    static std::atomic<DWORD>          s_overflowTid{ 0 };
-    static constexpr std::size_t       kStackToLog = 32 * 1024;   // a line costs ~3 KB, the logger's first use ~11 KB
+    static PVOID             s_vehHandle = nullptr;
+    static HANDLE            s_faultEvent = nullptr;   // auto-reset: a slot is ready, the watchdog drains at once
+    // CrashLogger.dll's image, found by the drain thread: its symbolizer probes memory while it writes a crash
+    // report, and those faults are its own. A range compare, so the handler never asks the loader; end is stored
+    // before base (release) and base is tested first, so a half-stored range matches nothing.
+    static std::atomic<std::uintptr_t> s_crashLoggerBase{ 0 };
+    static std::atomic<std::uintptr_t> s_crashLoggerEnd{ 0 };
 
-    static int  UnwindFromContext(CONTEXT* ctx, void** frames, int cap, std::uintptr_t stackLow, std::uintptr_t stackHigh);   // fwd (below)
-    static constexpr int kVehStackFrames = 24;
+    // This thread is inside the handler: a fault there (a damaged heap, a bad stack) must not re-enter it.
+    static thread_local bool t_inVeh = false;
 
     // Committed stack left below the caller on this thread. In a stack overflow that is all there is: the guard
     // page is spent, and a touch below it is an access violation the process does not survive.
+    static constexpr std::size_t kStackToWalk = 16 * 1024;   // the walk's own frames, with room to spare
     static std::size_t StackLeft()
     {
         const auto low = reinterpret_cast<std::uintptr_t>(reinterpret_cast<const NT_TIB*>(NtCurrentTeb())->StackLimit);
@@ -2993,35 +3016,30 @@ namespace Magelight {
         return sp > low ? sp - low : 0;
     }
 
+    static int  UnwindFromContext(CONTEXT* ctx, void** frames, int cap, std::uintptr_t stackLow, std::uintptr_t stackHigh);   // fwd (below)
+
     // The faulting thread's callers, from the exception's own CONTEXT: the thread is stopped in its handler, so
     // the stack is exactly the one that faulted. Bounded to this thread's committed stack (its TEB), capped in
-    // depth, and the unwinder's own faults are caught (t_walkingStack). noinline keeps its ~2 KB of buffers out
-    // of VectoredLogger's frame, which every severe exception pays, a stack overflow included.
-    static __declspec(noinline) void LogFaultStack(EXCEPTION_POINTERS* ep)
+    // depth, and the unwinder's own faults are caught (t_walkingStack). A call through null faults with Rip 0 and
+    // the caller's return address on top of the stack: the walk starts there.
+    static __declspec(noinline) int WalkFaultStack(EXCEPTION_POINTERS* ep, void** frames, bool& callerFirst)
     {
-        if (!ep->ContextRecord) return;
+        callerFirst = false;
+        if (!ep->ContextRecord) return 0;
         const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
         const auto stackLow = reinterpret_cast<std::uintptr_t>(tib->StackLimit);
         const auto stackHigh = reinterpret_cast<std::uintptr_t>(tib->StackBase);
-        if (stackHigh <= stackLow) return;
+        if (stackHigh <= stackLow) return 0;
         CONTEXT ctx = *ep->ContextRecord;
-        // A call through null faults with Rip 0 and the caller's return address on top of the stack: start there,
-        // and print that frame, which is not on the report line.
-        int first = 1;
         if (ctx.Rip == 0 && ctx.Rsp >= stackLow && ctx.Rsp + 8 <= stackHigh) {
             ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
             ctx.Rsp += 8;
-            first = 0;
+            callerFirst = true;
         }
-        void* frames[kVehStackFrames]{};
         t_walkingStack = true;
         const int n = UnwindFromContext(&ctx, frames, kVehStackFrames, stackLow, stackHigh);
         t_walkingStack = false;
-        for (int i = first; i < n; ++i) {   // frame 0 is otherwise the faulting address, already on the report line
-            char path[MAX_PATH]; std::uintptr_t off = 0;
-            const char* base = ModuleOffsetOf(frames[i], path, off);
-            SKSE::log::error("Magelight VEH:   #{:02} {}+0x{:X}", i, base, off);
-        }
+        return n > 0 ? n : 0;
     }
 
     static LONG CALLBACK VectoredLogger(EXCEPTION_POINTERS* ep)
@@ -3031,59 +3049,94 @@ namespace Magelight {
         if (code < 0xC0000000u) return EXCEPTION_CONTINUE_SEARCH;                       // not severe
         if (code == 0xC06D007Eu || code == 0xC06D007Fu) return EXCEPTION_CONTINUE_SEARCH;  // delay-load internals
         if (code == 0xE06D7363u) return EXCEPTION_CONTINUE_SEARCH;                      // C++ EH in flight
-        if (t_walkingStack) return EXCEPTION_CONTINUE_SEARCH;                           // a stack walk's own, caught
-
-        void* addr = ep->ExceptionRecord->ExceptionAddress;
-        const auto key = reinterpret_cast<std::uintptr_t>(addr);
-        if (code == EXCEPTION_STACK_OVERFLOW && StackLeft() < kStackToLog) {
-            if (!s_overflowParked.load(std::memory_order_acquire)) {
-                s_overflowAddr.store(key, std::memory_order_relaxed);
-                s_overflowTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
-                s_overflowParked.store(true, std::memory_order_release);
-            }
+        if (t_walkingStack || t_inVeh) return EXCEPTION_CONTINUE_SEARCH;               // our own walk, or a fault in here
+        if (!s_exceptionTelemetry.load(std::memory_order_relaxed)) return EXCEPTION_CONTINUE_SEARCH;
+        const auto key = reinterpret_cast<std::uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+        if (const auto clBase = s_crashLoggerBase.load(std::memory_order_acquire);
+            clBase && key >= clBase && key < s_crashLoggerEnd.load(std::memory_order_relaxed))
             return EXCEPTION_CONTINUE_SEARCH;
-        }
+        t_inVeh = true;
         const int seen = (std::min)(s_seenFaultCount.load(std::memory_order_acquire), kMaxSeenFaults);
         for (int i = 0; i < seen; ++i)
             if (s_seenFaults[i].code.load(std::memory_order_acquire) == code &&
-                s_seenFaults[i].addr.load(std::memory_order_relaxed) == key)
+                s_seenFaults[i].addr.load(std::memory_order_relaxed) == key) {
+                t_inVeh = false;
                 return EXCEPTION_CONTINUE_SEARCH;
+            }
         // Full: no claim (an unbounded count would wrap and index outside the table).
         if (seen >= kMaxSeenFaults) {
-            if (!s_seenFaultsFull.exchange(true))
-                SKSE::log::error("Magelight VEH: {} distinct fault sites logged; later new ones are not", kMaxSeenFaults);
+            s_seenFaultsFull.store(true, std::memory_order_relaxed);
+            t_inVeh = false;
             return EXCEPTION_CONTINUE_SEARCH;
         }
         const int slot = s_seenFaultCount.fetch_add(1, std::memory_order_acq_rel);
-        if (slot >= kMaxSeenFaults) return EXCEPTION_CONTINUE_SEARCH;   // lost the race for the last slot
-        s_seenFaults[slot].addr.store(key, std::memory_order_relaxed);
-        s_seenFaults[slot].code.store(code, std::memory_order_release);
-
-        char modPath[MAX_PATH]; std::uintptr_t offset = 0;
-        const char* modName = ModuleOffsetOf(addr, modPath, offset);
-        // CrashLogger's symbolizer probes memory while it writes a crash report; those faults are its own.
-        if (_stricmp(modName, "CrashLogger.dll") == 0) return EXCEPTION_CONTINUE_SEARCH;
-        SKSE::log::error(
-            "Magelight VEH: exception 0x{:08X} at {} (module {} +0x{:X}) on thread {}",
-            code, addr, modName, offset, GetCurrentThreadId());
-        if (code != EXCEPTION_STACK_OVERFLOW) LogFaultStack(ep);   // an overflow gets its line only
+        if (slot >= kMaxSeenFaults) { t_inVeh = false; return EXCEPTION_CONTINUE_SEARCH; }   // lost the race for the last slot
+        SeenFault& f = s_seenFaults[slot];
+        f.addr.store(key, std::memory_order_relaxed);
+        f.code.store(code, std::memory_order_release);
+        f.tid = GetCurrentThreadId();
+        // An overflow, or too little stack to walk safely, gets its line only.
+        f.overflow = code == EXCEPTION_STACK_OVERFLOW;
+        f.frameCount = (!f.overflow && StackLeft() >= kStackToWalk) ? WalkFaultStack(ep, f.frames, f.callerFirst) : 0;
+        f.ready.store(true, std::memory_order_release);
+        if (s_faultEvent) SetEvent(s_faultEvent);
+        t_inVeh = false;
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // The watchdog thread's half of a parked stack overflow (see s_overflowParked).
-    static void DrainParkedOverflow()
+    // The watchdog thread's half: finds CrashLogger's image once it is loaded, then writes every ready slot not
+    // yet logged. A crash usually still leaves time for it (CrashLogger writes its report first).
+    static void DrainFaultReports()
     {
-        if (!s_overflowParked.load(std::memory_order_acquire)) return;
-        void* addr = reinterpret_cast<void*>(s_overflowAddr.load(std::memory_order_relaxed));
-        const DWORD tid = s_overflowTid.load(std::memory_order_relaxed);
-        static void* s_lastLogged = nullptr;   // a handled overflow in a loop logs once, not four times a second
-        if (addr == s_lastLogged) { s_overflowParked.store(false, std::memory_order_release); return; }
-        s_lastLogged = addr;
-        char modPath[MAX_PATH]; std::uintptr_t offset = 0;
-        const char* modName = ModuleOffsetOf(addr, modPath, offset);
-        SKSE::log::error("Magelight VEH: exception 0x{:08X} (stack overflow) at {} (module {} +0x{:X}) on thread {}",
-                         static_cast<std::uint32_t>(EXCEPTION_STACK_OVERFLOW), addr, modName, offset, tid);
-        s_overflowParked.store(false, std::memory_order_release);
+        if (!s_crashLoggerEnd.load(std::memory_order_relaxed)) {
+            if (HMODULE cl = GetModuleHandleW(L"CrashLogger.dll")) {
+                const auto base = reinterpret_cast<std::uintptr_t>(cl);
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(cl);
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+                s_crashLoggerEnd.store(base + nt->OptionalHeader.SizeOfImage, std::memory_order_relaxed);
+                s_crashLoggerBase.store(base, std::memory_order_release);
+            }
+        }
+        static bool s_explained = false;
+        const int seen = (std::min)(s_seenFaultCount.load(std::memory_order_acquire), kMaxSeenFaults);
+        for (int i = 0; i < seen; ++i) {
+            SeenFault& f = s_seenFaults[i];
+            if (f.logged || !f.ready.load(std::memory_order_acquire)) continue;
+            f.logged = true;
+            void* addr = reinterpret_cast<void*>(f.addr.load(std::memory_order_relaxed));
+            char modPath[MAX_PATH]; std::uintptr_t offset = 0;
+            const char* modName = ModuleOffsetOf(addr, modPath, offset);
+            if (_stricmp(modName, "CrashLogger.dll") == 0) continue;   // before its range was known
+            if (!s_explained) {
+                s_explained = true;
+                SKSE::log::info("Magelight VEH: each line below is the first time a severe exception was raised at "
+                                "that address, whoever raised it. Most are handled by the mod that raised them and "
+                                "are not crashes; a crash is in CrashLogger's report. Magelight only records them.");
+            }
+            SKSE::log::error("Magelight VEH: exception 0x{:08X}{} at {} (module {} +0x{:X}) on thread {}",
+                             f.code.load(std::memory_order_relaxed), f.overflow ? " (stack overflow)" : "",
+                             addr, modName, offset, f.tid);
+            // Frame 0 is the faulting address, on the line above, except after a call through null (its caller).
+            for (int k = f.callerFirst ? 0 : 1; k < f.frameCount; ++k) {
+                char path[MAX_PATH]; std::uintptr_t off = 0;
+                const char* base = ModuleOffsetOf(f.frames[k], path, off);
+                SKSE::log::error("Magelight VEH:   #{:02} {}+0x{:X}", k, base, off);
+            }
+        }
+        static bool s_fullLogged = false;
+        if (!s_fullLogged && s_seenFaultsFull.load(std::memory_order_relaxed)) {
+            s_fullLogged = true;
+            SKSE::log::error("Magelight VEH: {} distinct fault sites logged; later new ones are not", kMaxSeenFaults);
+        }
+    }
+
+    // Magelight.json "exceptionTelemetry": false - take the handler out of the chain.
+    static void ApplyExceptionTelemetrySetting()
+    {
+        if (s_exceptionTelemetry.load() || !s_vehHandle) return;
+        RemoveVectoredExceptionHandler(s_vehHandle);
+        s_vehHandle = nullptr;
+        SKSE::log::info("Magelight: vectored exception telemetry off (Magelight.json \"exceptionTelemetry\": false)");
     }
 
     // ── Stall watchdog (0.28.3) ──────────────────────────────────────────
@@ -3238,8 +3291,9 @@ namespace Magelight {
         long long lastReportMs = 0;
         int       reports      = 0;
         for (;;) {
-            std::this_thread::sleep_for(milliseconds(250));
-            DrainParkedOverflow();
+            if (s_faultEvent) WaitForSingleObject(s_faultEvent, 250);
+            else std::this_thread::sleep_for(milliseconds(250));
+            DrainFaultReports();
             if (!s_stallWatchdog.load() || reports >= 12) continue;
             const long long lastMs = s_lastPresentMs.load();
             if (!lastMs || !s_worldReady.load()) continue;   // nothing to watch yet
@@ -3263,7 +3317,8 @@ namespace Magelight {
 
     void InstallCrashTelemetry()
     {
-        AddVectoredExceptionHandler(1, &VectoredLogger);
+        s_faultEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        s_vehHandle = AddVectoredExceptionHandler(1, &VectoredLogger);
         SKSE::log::info("Magelight: vectored exception telemetry armed");
         std::thread(&StallWatchdogLoop).detach();
         SKSE::log::info("Magelight: stall watchdog armed (threshold {} ms; Magelight.json \"stallWatchdog\": false disables)",
@@ -7289,6 +7344,7 @@ float4 ps_straight(VSOut i) : SV_Target {
         // Host settings (toggle key, demo views) — s_runtimeDir is set by
         // PreloadRuntime, well before kDataLoaded lands here.
         LoadHostSettings();
+        ApplyExceptionTelemetrySetting();
         InstallPolledKeyFilter();
         s_engineMode = !REL::Module::IsVR()
             && (s_compositeMode == "engine" || (s_compositeMode == "auto" && SmoothMotionLoaded()))

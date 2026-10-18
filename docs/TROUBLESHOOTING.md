@@ -216,6 +216,7 @@ it read, or says that defaults are in effect.
 | `loadStagger`, `loadBudgetMs` | `true`, `8` | 0.31.0: views not yet opened start loading their pages one per frame after a load, the next once the previous page is ready or failed (or 100 ms passed) and the last frame's page work took under `loadBudgetMs` (1-100), at most about a second per batch; a view being opened, or visible at creation, loads at once. `false` loads every page in the same frame, as before 0.31.0. See "Performance" |
 | `blockPolledKeys` | `true` | 0.31.10: while a page holds UI mode, other SKSE plugins that ask Windows for the key state themselves (`GetAsyncKeyState` / `GetKeyState`) read every keyboard key as up, so typing into a page cannot fire their hotkeys. The plugin whose page it is is exempt. `false` installs no filter |
 | `stallWatchdog`, `stallThresholdMs` | `true`, `1500` | Log the present and main threads' stacks when no frame is presented for this long (250-60000 ms); the first time per session, every other thread's too |
+| `exceptionTelemetry` | `true` | The `Magelight VEH` lines (see "Magelight VEH" below). `false` takes Magelight's exception handler out of the game entirely, from the main menu on |
 | `vr` | see below | Skyrim VR only |
 
 The `vr` block: `enabled` (`true`), `mirror` (`true`: keep drawing pages on the desktop mirror),
@@ -234,8 +235,8 @@ hide OpenComposite's own menu laser over Magelight pages), `aimUseTip` (`true`) 
 crashed inside a frame, in Ultralight or in Magelight's own frame code. Magelight caught the crash so
 the game keeps running, and turned its overlay off for the rest of the session: restart the game to
 bring the UI back (loading a save does not). Post the whole log with the report. The
-`Magelight VEH: exception ... (module <dll> +0x...)` line above it (with its `#NN` caller lines under
-it) names the module and offset; a place that faulted earlier in the session is named by its first
+`Magelight VEH: exception ... (module <dll> +0x...)` line just after it (written a moment later by another
+thread, with its `#NN` caller lines under it) names the module and offset; a place that faulted earlier in the session is named by its first
 line, and new places stop being logged after 64: `MgWCore.dll` is Ultralight's web engine (see the VEH section below). `MgWCore.dll +0xFB7F77` before 0.31.3
 was a PC where Arial could not be loaded. Since 0.31.3 the `fonts:` lines near the top of the log
 name the last-resort font the session uses and, when Arial could not be used, why.
@@ -244,10 +245,15 @@ name the last-resort font the session uses and, when Arial could not be used, wh
 
 `Magelight VEH: exception ...` records each serious exception raised on any thread of the
 game, once per place it happens (up to 64 places a session), including ones another mod raises and
-handles itself. The `Magelight VEH:   #01 <module>+0x...` lines under it are the calls that led
-there, most recent first: they tell a fault Magelight caused from another mod's or the game's own
-(a stack overflow gets the one line only, written a moment later by another thread when the
-overflowed one has too little stack left to write it). `Magelight stall: ...`
+handles itself: most of them are exactly that and are not crashes (the first such line says so).
+The `Magelight VEH:   #01 <module>+0x...` lines under it are the calls that led there, most recent
+first: they tell a fault Magelight caused from another mod's or the game's own (a stack overflow
+gets the one line only). Magelight never handles these exceptions, so the mod that raised one, the
+game and CrashLogger see each as if Magelight were not there, and its faults while writing a crash
+report are left out. The handler only notes the fault and returns; another thread writes the lines
+a moment later, so this handler can no longer hang a crash before CrashLogger writes its report. A
+game that dies at once (no CrashLogger) can end before the line is written: the crash report is the
+record. `"exceptionTelemetry": false` in `Magelight.json` turns the handler off. `Magelight stall: ...`
 records the stacks of the present and main threads when no frame was presented for longer than
 `stallThresholdMs` (a long save or a hitch can do that). The first sample of a session also
 records every other game thread (up to 64, labelled `other`), which names the thread a hang is

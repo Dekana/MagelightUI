@@ -62,6 +62,18 @@ The **"added in"** column is the version to put in `minHost` (manifest) /
   for the whole page), or cancels the `magelight:tooltip` event (`detail.text`, `detail.target`), or
   the user sees both. The look follows `--ml-tooltip-bg`, `--ml-tooltip-fg`, `--ml-tooltip-border` and
   `--ml-tooltip-font` where the page sets them.
+- **The exception log can no longer get in CrashLogger's way.** Magelight's exception handler (the
+  `Magelight VEH` lines) runs before CrashLogger for every serious exception, a real crash included. It
+  never handled them, but it wrote its log line from inside the handler, so a crash in the middle of
+  Magelight's own logging could hang the game there instead of letting CrashLogger write its report, and a
+  fault while writing the line (a damaged heap) re-entered the handler. The handler now only notes the fault
+  and its stack, with no lock of its own, no allocation and no loader call, and wakes the watchdog thread,
+  which writes the lines; it never re-enters itself. A call through null names its caller again in the stack
+  lines.
+- **The log says what the lines are**: the first `Magelight VEH` line of a session is preceded by a note
+  that each records the first exception at an address, whoever raised it, that most are handled by the mod
+  that raised them, and that a crash is in CrashLogger's report.
+- **`"exceptionTelemetry": false`** in `Magelight.json` takes the handler out entirely (from kDataLoaded).
 
 ## 1.1.0
 
