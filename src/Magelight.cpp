@@ -85,6 +85,7 @@ namespace Magelight {
     //   "fontHinting": "normal", "fontGamma": 1.8   // text rasterization: smooth|normal|monochrome|none, gamma 1.0-3.0
     //   "animationTimerDelay": 0.001   // seconds between requestAnimationFrame ticks; below the frame period = once per frame
     //   "msaa": 4             // GPU path: anti-aliasing samples for page shapes (1 = off, 2, 4, 8)
+    //   "ulFiberMB": 8        // 1.3.0: the stack pages run on, in MB (2..64); 0 = the game's own frame stack
     //   "vr": { "enabled": true, "submitViews": true, "mirror": true, "alpha": "straight",
     //            "beam": true, "beamAlpha": 0.55, "cursorScale": 0.012, "cursorDot": true,   // laser-end pointer: a point (0.26.12); false = the arrow art
     //            "suppressRuntimeLaser": true, "aimUseTip": true, "aimPitchDeg": -35,
@@ -145,6 +146,8 @@ namespace Magelight {
     // smooth themselves. Each sample adds a copy of every render target in video memory: a page's own (2560x1440:
     // ~15 MB a sample, held while the view exists, hidden or not) and each layer Ultralight composites inside it.
     static int         s_msaa        = 4;
+    // Magelight.json "ulFiberMB" (1.3.0): the stack the frame work runs on (see UlFiberMain). 0 = the game's own.
+    static int         s_ulFiberMb   = 8;
     // Cursor art: the flat cursor is drawn in code (MagelightCursorArt.h) and follows the page's CSS cursor.
     // "cursorFile" (relative to the runtime dir, or absolute; default none) replaces it with a still image,
     // "cursorHeight" is the drawn height in px at 1080p (scaled with resolution) and "cursorHotspotX/Y"
@@ -476,6 +479,12 @@ namespace Magelight {
                 s_msaa = asked >= 8 ? 8 : asked >= 4 ? 4 : asked >= 2 ? 2 : 1;
                 if (asked != s_msaa) SKSE::log::warn("Magelight: msaa {} is not 1, 2, 4 or 8 - using {}", asked, s_msaa);
             }
+            if (auto it = j.find("ulFiberMB"); it != j.end() && it->is_number()) {
+                const double asked = it->get<double>();
+                s_ulFiberMb = asked <= 0.0 ? 0 : static_cast<int>(std::clamp(asked, 2.0, 64.0));
+                if (asked > 0.0 && asked != s_ulFiberMb)
+                    SKSE::log::warn("Magelight: ulFiberMB {} is outside 2..64 - using {}", asked, s_ulFiberMb);
+            }
             if (auto it = j.find("logLevel"); it != j.end() && it->is_string()) {
                 const std::string l = HotkeyNames::Lower(it->get<std::string>());
                 const auto lvl = l == "trace" ? spdlog::level::trace : l == "debug" ? spdlog::level::debug
@@ -565,10 +574,11 @@ namespace Magelight {
                 s_modCursors.store(it->get<bool>());
             static constexpr const char* kConsoleLogNames[] = { "none", "errors", "warnings", "all" };
             SKSE::log::info("Magelight: settings loaded (toggleKey={}, demoViews={}, imageProbe={}, devMode={}, consoleLog={}, "
-                            "loadStagger={}, loadBudgetMs={}, cursorForce={}, modCursors={}, msaa={}, exceptionTelemetry={})",
+                            "loadStagger={}, loadBudgetMs={}, cursorForce={}, modCursors={}, msaa={}, ulFiberMB={}, "
+                            "exceptionTelemetry={})",
                 s_toggleKey.load(), s_demoViews, s_imageProbe, s_devMode.load(), kConsoleLogNames[ConsoleLogLevel()],
                 s_loadStagger.load(), s_loadBudgetMs.load(), s_cursorForce.load(), s_modCursors.load(), s_msaa,
-                s_exceptionTelemetry.load());
+                s_ulFiberMb, s_exceptionTelemetry.load());
         } catch (...) {
             SKSE::log::warn("Magelight: Magelight.json unreadable — defaults in effect");
         }
@@ -768,6 +778,9 @@ namespace Magelight {
     static std::vector<std::unique_ptr<MlView>> s_views;  // z-order = (layer, order), see SortViewsLocked
     static std::atomic<std::uint64_t> s_nextViewId{ 1 };
     static std::atomic<std::uint64_t> s_uiModeView{ 0 };  // UI mode's show/focus target
+    // The view that entered UI mode last (Api4::ViewLabel), kept in a plain buffer so the exception handler can name
+    // it without a lock or an allocation. Game thread writes; a torn read only garbles a log line.
+    static char s_uiModeLabel[160] = "none yet";
     // The view the TOGGLE KEY opens — set only by SetUIModeView (the host's
     // own/demo UI). EnterUIMode deliberately does NOT set it: a consumer's
     // (SA's) view must never be re-opened by our key behind the consumer's
@@ -2715,7 +2728,9 @@ namespace Magelight {
             Emit(HostEvent::UIModeRefused, uiView, 0, 0, "renderer not ready");
             return;
         }
-        SKSE::log::info("Magelight: SetUIMode({}{}) begin", on, (on && pauseGame) ? ", paused" : "");
+        if (on) strncpy_s(s_uiModeLabel, Api4::ViewLabel(uiView).c_str(), _TRUNCATE);
+        SKSE::log::info("Magelight: SetUIMode({}{}) begin - {}", on, (on && pauseGame) ? ", paused" : "",
+                        s_uiModeLabel);
         s_focused.store(on);
         s_focusMenuHideSeen.store(false);   // a hide from an earlier session is no news about this one
         if (on) s_uiModeEnteredMs.store(GetTickCount64());
@@ -3214,6 +3229,18 @@ namespace Magelight {
         const auto low = reinterpret_cast<std::uintptr_t>(reinterpret_cast<const NT_TIB*>(NtCurrentTeb())->StackLimit);
         const auto sp = reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress());
         return sp > low ? sp - low : 0;
+    }
+
+    // Stack left below the caller in the whole reservation of the stack it runs on (StackLeft counts only the
+    // committed part), in KB. The reservation's base is the stack's end (GetCurrentThreadStackLimits needs the
+    // Windows 8 headers).
+    static std::size_t StackReserveLeftKb()
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        const auto sp = reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress());
+        if (!VirtualQuery(reinterpret_cast<const void*>(sp), &mbi, sizeof(mbi))) return 0;
+        const auto low = reinterpret_cast<std::uintptr_t>(mbi.AllocationBase);
+        return sp > low ? (sp - low) / 1024 : 0;
     }
 
     static int  UnwindFromContext(CONTEXT* ctx, void** frames, int cap, std::uintptr_t stackLow, std::uintptr_t stackHigh);   // fwd (below)
@@ -6319,8 +6346,8 @@ float4 ps_straight(VSOut i) : SV_Target {
     static LONG LogSehAndDisable(const char* where, unsigned long code, void* addr)
     {
         SKSE::log::error(
-            "Magelight: SEH exception 0x{:08X} at {} in {} — overlay disabled, UI mode will drop",
-            code, addr, where);
+            "Magelight: SEH exception 0x{:08X} at {} in {} — overlay disabled, UI mode will drop (UI mode {}: {})",
+            code, addr, where, s_focused.load() ? "on" : "off, last", static_cast<const char*>(s_uiModeLabel));
         NoteRenderFailure("an exception in the frame or input path");   // a static literal: no allocation in a handler
         s_renderDead.store(true);
         return EXCEPTION_EXECUTE_HANDLER;
@@ -6947,13 +6974,127 @@ float4 ps_straight(VSOut i) : SV_Target {
     }
 
     // SEH wrapper — no locals with destructors allowed in here.
-    static void GuardedFrameWork(IDXGISwapChain* sc)
+    static void GuardedFrameWorkHere(IDXGISwapChain* sc)
     {
         __try {
             FrameWork(sc);
         } __except (LogSehAndDisable("frame work", GetExceptionCode(),
                         (GetExceptionInformation())->ExceptionRecord->ExceptionAddress)) {
         }
+    }
+
+    // Pages on a stack of their own (1.3.0). The game gives its main thread 1 MB (the exe header) and presents deep
+    // in its frame, under every other Present hook, so WebKit ran in what was left there: a page that recursed in
+    // its scripts and then laid itself out, or laid out a deeply nested page, could run it out (0xC00000FD in the
+    // frame work, the overlay off for the session). The frame work runs on this fiber on the same thread, so
+    // Ultralight keeps its one thread (invariant 1) and gets ulFiberMB of stack. Every Ultralight call is made in
+    // the frame work, so WebKit has known this stack as the thread's own since Renderer::Create: its script limits
+    // and its collector's scan of the stack both read it. Main thread only.
+    static LPVOID          s_ulFiber = nullptr;
+    static LPVOID          s_ulFiberReturn = nullptr;   // the fiber the frame work hands back to
+    static IDXGISwapChain* s_ulFiberSwapChain = nullptr;
+    static unsigned        s_gameMxcsr = 0;             // the game's SSE mode at Present, which the pages run under
+    static bool            s_ulFiberTried = false;
+
+    static void CALLBACK UlFiberMain(void*)
+    {
+        // Room on this stack for the overflow handler's own work (a guarantee is per fiber).
+        ULONG guarantee = 64 * 1024;
+        SetThreadStackGuarantee(&guarantee);
+        for (;;) {
+            _mm_setcsr(s_gameMxcsr);   // as before 1.3.0, WebKit runs under the game's floating-point mode
+            GuardedFrameWorkHere(s_ulFiberSwapChain);
+            SwitchToFiber(s_ulFiberReturn);
+        }
+    }
+
+    // The process is exiting: Ultralight's objects are left alive, not destroyed. Their destructors would run on the
+    // exiting stack, which WebKit does not know as this thread's (it knows the page fiber's), so a garbage collection
+    // or stack scan in them would read the wrong range; the process ends either way. Registered once the fiber exists,
+    // after these statics were built, so it runs before their destructors.
+    static void LeaveUltralightAtExit()
+    {
+        (void)s_ulRenderer.LeakRef();
+        if (auto* views = new (std::nothrow) std::vector<std::unique_ptr<MlView>>()) views->swap(s_views);
+        if (auto* sessions = new (std::nothrow) std::map<std::string, ultralight::RefPtr<ultralight::Session>>())
+            sessions->swap(s_sessions);
+        if (auto* images = new (std::nothrow) std::vector<std::unique_ptr<MlImage>>()) images->swap(s_images);
+    }
+
+    // False: the frame work runs on the caller's stack, as before 1.3.0. Decided once, before the renderer exists.
+    static bool EnsureUlFiber()
+    {
+        if (s_ulFiber) return true;
+        if (s_ulFiberTried) return false;
+        s_ulFiberTried = true;
+        if (s_ulFiberMb <= 0) {
+            SKSE::log::info("Magelight: pages run on the game's frame stack (ulFiberMB 0)");
+            return false;
+        }
+        if (s_renderInit) {   // WebKit already knows the game's stack as this thread's: it must stay there
+            SKSE::log::warn("Magelight: the renderer started before the page stack - pages run on the game's stack");
+            return false;
+        }
+        // The game's own floating-point state is saved across the switch with the flag (and by hand around it,
+        // for a thread another plugin made a fiber).
+        if (!IsThreadAFiber() && !ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH)) {
+            SKSE::log::warn("Magelight: the main thread could not become a fiber (error {}) - pages run on the "
+                            "game's stack", GetLastError());
+            return false;
+        }
+        s_ulFiber = CreateFiberEx(256 * 1024, static_cast<SIZE_T>(s_ulFiberMb) << 20, FIBER_FLAG_FLOAT_SWITCH,
+                                  &UlFiberMain, nullptr);
+        if (!s_ulFiber) {
+            SKSE::log::warn("Magelight: the page stack ({} MB) could not be created (error {}) - pages run on the "
+                            "game's stack", s_ulFiberMb, GetLastError());
+            return false;
+        }
+        std::atexit(&LeaveUltralightAtExit);
+        SKSE::log::info("Magelight: pages run on a stack of their own ({} MB, a fiber on the game's main thread)",
+                        s_ulFiberMb);
+        return true;
+    }
+
+    // How much of its own stack the game's frame leaves at Present: at the first frame and at each new low (16 KB
+    // steps). Without the page stack it is all the pages get. A stack guarantee (another plugin's, for its crash
+    // handler) moves the overflow up by its size, and WebKit's script limit does not count it: on the game's stack
+    // a script at that limit then overflows while its error is built.
+    static void NoteGameStack(bool onFiber)
+    {
+        static std::size_t s_lowest = SIZE_MAX;
+        const std::size_t  left = StackReserveLeftKb();
+        if (left + 16 > s_lowest) return;
+        s_lowest = left;
+        ULONG guarantee = 0;   // 0 reads the thread's guarantee without changing it
+        const bool known = SetThreadStackGuarantee(&guarantee) != 0;
+        const std::string held = !known ? std::string("stack guarantee unknown")
+                                 : guarantee ? std::to_string(guarantee / 1024) + " KB of it held back by a stack guarantee"
+                                             : std::string("no stack guarantee");
+        SKSE::log::info("Magelight: the game's frame leaves {} KB of its stack at Present (the lowest this session; {}){}",
+                        left, held, onFiber ? "; pages run on their own" : "; pages run in it");
+    }
+
+    static void GuardedFrameWork(IDXGISwapChain* sc)
+    {
+        // Before the world is ready the frame work returns before any Ultralight call, so the fiber can start here.
+        if (GetCurrentThreadId() == s_mainThreadId) {
+            // Called from inside the frame work itself (no path does today): the frame is already being worked.
+            if (s_ulFiber && IsThreadAFiber() && GetCurrentFiber() == s_ulFiber) return;
+            const bool fiber = EnsureUlFiber();
+            NoteGameStack(fiber);
+            if (fiber) {
+                // Another plugin may have turned the thread back into a plain one since. Once WebKit knows the
+                // fiber's stack the frame work never runs on the game's, so a frame that cannot switch is skipped.
+                if (!IsThreadAFiber() && !ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH)) return;
+                s_ulFiberSwapChain = sc;
+                s_ulFiberReturn = GetCurrentFiber();
+                s_gameMxcsr = _mm_getcsr();
+                SwitchToFiber(s_ulFiber);
+                _mm_setcsr(s_gameMxcsr);   // the game goes on in its own mode, whatever a page set
+                return;
+            }
+        }
+        GuardedFrameWorkHere(sc);
     }
 
     // IDXGISwapChain::ResizeBuffers (vtable slot 13): resolution / fullscreen
@@ -8291,7 +8432,8 @@ float4 ps_straight(VSOut i) : SV_Target {
             s_tooltipLeaveAll.store(true);
             InvokeJS(old, "window.magelight&&window.magelight._dispatch('__uimode','0');");
             InvokeJS(view, "window.magelight&&window.magelight._dispatch('__uimode','1');");
-            SKSE::log::info("Magelight: UI mode switched from view {} to view {}", old, view);
+            strncpy_s(s_uiModeLabel, Api4::ViewLabel(view).c_str(), _TRUNCATE);
+            SKSE::log::info("Magelight: UI mode switched from view {} to {}", old, s_uiModeLabel);
             Emit(HostEvent::UIModeSwitched, view);
         });
     }

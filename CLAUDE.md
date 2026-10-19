@@ -43,7 +43,10 @@ build.ps1                   build → C:\b\mgl (or MG_BUILD_DIR), stage → <tha
 
 1. **Ultralight lives on ONE thread**: created on the game's main thread (= in-game present
    thread) after `kPostLoadGame`/`kNewGame` (`s_worldReady`, `s_mainThreadId`); frames from any
-   other thread skip all Ultralight work (`s_ulThreadId`). Violations fastfail with no crashlog.
+   other thread skip all Ultralight work (`s_ulThreadId`). Violations fastfail with no crashlog. Since 1.3.0
+   the frame work runs on a fiber of that thread (`UlFiberMain`, `"ulFiberMB"`), and WebKit knows the
+   fiber's stack as the thread's: an Ultralight call anywhere outside `FrameWork` would run on the game's
+   stack against the fiber's bounds (script limits and the collector's stack scan both wrong).
 2. **Listener callbacks fire on the render thread** (JS listeners, DOM ready, console, load
    failed). Game state = `GameTask::Post` (`MagelightGameTask.h` says why), never a raw
    `SKSE::GetTaskInterface()->AddTask`; mods use `PostGameTask`. A new main-thread entry point

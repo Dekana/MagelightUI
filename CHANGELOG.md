@@ -50,6 +50,24 @@ The **"added in"** column is the version to put in `minHost` (manifest) /
 | 0.11.0 | — | Sessions / manifest docs |
 | 0.10.0 | — | API v4 (`MagelightApi4`): per-mod registration, texture images, UI mode, events |
 
+## 1.3.0
+
+- **Pages run on a stack of their own.** The game gives its main thread 1 MB of stack and calls Magelight
+  deep inside its frame, below every other plugin that hooks it, so pages ran in whatever was left. A page
+  whose script recursed and then laid itself out, or a page nested hundreds of levels deep, could use that
+  up, and so could any script that ran into the engine's recursion limit on a game where another plugin
+  holds the end of that stack back for its crash handler (a stack guarantee, which the engine's limit does
+  not count): `SEH exception 0xC00000FD ... in frame work` in `Magelight.log`, and Magelight then turned its
+  overlay off for the session. Magelight now runs all its page work on an 8 MB stack of its own, a fiber on the
+  game's main thread, so pages still run on that one thread and a runaway script gets "Maximum call stack
+  size exceeded" like in a browser. `"ulFiberMB"` in `Magelight.json` sizes it (2 to 64), and `0` runs the
+  pages on the game's stack as before.
+- **`Magelight.log` says how much stack the game's frame leaves**: `the game's frame leaves ... KB of its stack
+  at Present`, with the stack guarantee on it, at the first frame and at each new low.
+- **`Magelight.log` names the page that holds UI mode**: the `SetUIMode` and `UI mode switched` lines, and the
+  `overlay disabled` line after an exception, give the view's name and its mod (`view 4 'config' of
+  CompassPlus`), so a report shows which page was open.
+
 ## 1.2.0
 
 - **`title` tooltips show.** Ultralight reports the title under the pointer but draws nothing, so a

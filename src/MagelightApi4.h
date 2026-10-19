@@ -64,6 +64,8 @@ namespace Magelight::Api4 {
     // Page globals (InstallBridgeShims): the view's identity and the host's
     // capability table as JSON fragments for window.__MAGELIGHT__.
     std::string ViewIdentityJson(ViewId view);   // "modId":"..","viewName":".." ("" both for v1-v3 views)
+    // For the log: "view 4 'config' of CompassPlus", or "view 3" for a v1-v3 view.
+    std::string ViewLabel(ViewId view);
     std::string CapabilitiesJson();              // {"gpu":1,"textureImage":1,...}
 
     // 0.16.0

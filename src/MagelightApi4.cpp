@@ -1196,6 +1196,17 @@ namespace Magelight::Api4 {
         }
     }
 
+    std::string ViewLabel(ViewId view)
+    {
+        std::lock_guard<std::mutex> lk(s_mutex);
+        std::string label = "view " + std::to_string(view);
+        if (const Mod* m = FindLocked(OwnerLocked(view))) {
+            if (auto v = m->views.find(view); v != m->views.end()) label += " '" + v->second.name + "'";
+            label += " of " + m->modId;
+        }
+        return label;
+    }
+
     std::string ViewIdentityJson(ViewId view)
     {
         std::lock_guard<std::mutex> lk(s_mutex);
